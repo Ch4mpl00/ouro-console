@@ -1,0 +1,236 @@
+use axum::{
+    Router,
+    body::Body,
+    http::{Request as HttpRequest, StatusCode},
+};
+use http_body_util::BodyExt;
+use ouro_console::{
+    client::*,
+    fake::FakeControl,
+    mcp::{Mcp, WRITES},
+    web::{WebConfig, router},
+};
+use serde_json::{Value, json};
+use std::{collections::BTreeSet, sync::Arc};
+use tower::ServiceExt;
+
+fn setup(read_only: bool) -> (Router, Arc<FakeControl>) {
+    let fake = Arc::new(FakeControl::new());
+    let session = Session {
+        client: fake.clone(),
+        actor: "mcp-operator".into(),
+        read_only,
+    };
+    (
+        router(
+            session,
+            WebConfig::new("127.0.0.1:8090".parse().unwrap(), None, None).unwrap(),
+        ),
+        fake,
+    )
+}
+async fn rpc(app: &Router, method: &str, params: Value) -> Value {
+    let response = app
+        .clone()
+        .oneshot(
+            HttpRequest::builder()
+                .method("POST")
+                .uri("/mcp")
+                .header("host", "localhost:8090")
+                .header("content-type", "application/json")
+                .header("accept", "application/json, text/event-stream")
+                .header("mcp-protocol-version", "2025-11-25")
+                .body(Body::from(
+                    json!({"jsonrpc":"2.0","id":1,"method":method,"params":params}).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = response.status();
+    let bytes = response.into_body().collect().await.unwrap().to_bytes();
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "{}",
+        String::from_utf8_lossy(&bytes)
+    );
+    serde_json::from_slice(&bytes).unwrap()
+}
+async fn call(app: &Router, name: &str, args: Value) -> Value {
+    rpc(app, "tools/call", json!({"name":name,"arguments":args})).await
+}
+#[tokio::test]
+async fn streamable_http_initializes_and_lists_all_schemas() {
+    let (app, _) = setup(false);
+    let init = rpc(&app,"initialize",json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"tests","version":"1"}})).await;
+    assert!(
+        init["result"]["capabilities"]["tools"].is_object(),
+        "{init}"
+    );
+    assert_eq!(init["result"]["serverInfo"]["name"], "ouro-console");
+    let list = rpc(&app, "tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    let names: BTreeSet<_> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert_eq!(
+        names,
+        BTreeSet::from([
+            "list_runs",
+            "inspect_run",
+            "run_log",
+            "list_pending",
+            "respond",
+            "list_definitions",
+            "list_workers",
+            "cancel_run",
+            "cancel_tree",
+            "pause_definition",
+            "resume_definition",
+            "stop_all",
+            "resume_all"
+        ])
+    );
+    for tool in tools {
+        assert_eq!(tool["inputSchema"]["type"], "object");
+        if WRITES.contains(&tool["name"].as_str().unwrap()) {
+            assert!(
+                tool["inputSchema"]["required"]
+                    .as_array()
+                    .unwrap()
+                    .contains(&json!("reason")),
+                "{tool}"
+            );
+            assert_eq!(
+                tool["inputSchema"]["properties"]["reason"]["type"],
+                "string"
+            );
+        }
+    }
+}
+#[tokio::test]
+async fn every_tool_can_be_called_over_http_and_writes_are_real() {
+    for (name, args) in [
+        ("list_runs", json!({"state":"running","limit":100})),
+        ("inspect_run", json!({"run":"run-002"})),
+        ("run_log", json!({"run":"run-002"})),
+        ("list_pending", json!({"event_type":"review.decision"})),
+        ("list_definitions", json!({})),
+        ("list_workers", json!({})),
+        (
+            "cancel_run",
+            json!({"run":"run-002","reason":"test cancellation","request_id":"test"}),
+        ),
+        (
+            "cancel_tree",
+            json!({"run":"run-002","reason":"test tree","request_id":"test"}),
+        ),
+        (
+            "pause_definition",
+            json!({"definition":"review","note":"investigation","reason":"test pause","request_id":"test"}),
+        ),
+        (
+            "resume_definition",
+            json!({"definition":"cleanup","reason":"test resume","request_id":"test"}),
+        ),
+        (
+            "stop_all",
+            json!({"reason":"test stop","request_id":"test"}),
+        ),
+        (
+            "resume_all",
+            json!({"reason":"test resume","request_id":"test"}),
+        ),
+        (
+            "respond",
+            json!({"run":"run-003","wait":"/decision","event":{"source":"tests","id":"event-1","type":"review.decision","data":{"decision":"approve"}},"reason":"reviewed","request_id":"test"}),
+        ),
+    ] {
+        let (app, fake) = setup(false);
+        if name == "resume_all" {
+            fake.emergency_stop(
+                &Request {
+                    id: "seed".into(),
+                    actor: "seed".into(),
+                    reason: "seed".into(),
+                },
+                true,
+            )
+            .await
+            .unwrap();
+        }
+        let reply = call(&app, name, args).await;
+        assert!(reply.get("error").is_none(), "{name}: {reply}");
+        assert_ne!(reply["result"]["isError"], true, "{name}: {reply}");
+        assert!(
+            reply["result"]["content"]
+                .as_array()
+                .is_some_and(|c| !c.is_empty()),
+            "{name}: {reply}"
+        );
+        if WRITES.contains(&name) {
+            let entry = fake.entry("test").await.unwrap().unwrap();
+            assert_eq!(entry.request.actor, "mcp-operator");
+            assert!(reply.to_string().contains("mcp-operator"));
+        }
+        match name {
+            "list_runs" => {
+                assert!(reply.to_string().contains("run-002"));
+                assert!(!reply.to_string().contains("run-003"));
+            }
+            "cancel_run" | "cancel_tree" => assert_eq!(
+                fake.inspect("run-008").await.unwrap().unwrap().run.state,
+                RunState::Cancelled
+            ),
+            "pause_definition" => assert!(fake.definitions().await.unwrap()[0].tripped.is_some()),
+            "resume_definition" => assert!(fake.definitions().await.unwrap()[3].tripped.is_none()),
+            "stop_all" => assert!(fake.stopped().await.unwrap()),
+            "resume_all" => assert!(!fake.stopped().await.unwrap()),
+            "respond" => assert_eq!(
+                fake.inspect("run-003").await.unwrap().unwrap().run.state,
+                RunState::Ready
+            ),
+            _ => {}
+        }
+    }
+}
+#[tokio::test]
+async fn mcp_rejects_missing_or_blank_reasons_for_every_write() {
+    let (app, _) = setup(false);
+    for name in WRITES {
+        let args = json!({"run":"run-003","wait":"/decision","definition":"review","event":{}});
+        let reply = call(&app, name, args.clone()).await;
+        assert!(
+            reply.get("error").is_some() || reply["result"]["isError"] == true,
+            "{name}: {reply}"
+        );
+        let mut args = args;
+        args["reason"] = json!(" ");
+        let reply = call(&app, name, args).await;
+        assert!(
+            reply.get("error").is_some() || reply["result"]["isError"] == true,
+            "{name}: {reply}"
+        );
+    }
+}
+#[tokio::test]
+async fn read_only_mcp_exposes_and_accepts_only_reads() {
+    let (app, fake) = setup(true);
+    let list = rpc(&app, "tools/list", json!({})).await;
+    let tools = list["result"]["tools"].as_array().unwrap();
+    assert_eq!(tools.len(), 6);
+    for name in WRITES {
+        assert!(!tools.iter().any(|t| t["name"] == name));
+        let reply = call(&app, name, json!({"reason":"attempt"})).await;
+        assert!(
+            reply.get("error").is_some() || reply["result"]["isError"] == true,
+            "{reply}"
+        );
+    }
+    assert!(!fake.stopped().await.unwrap());
+    let info = Mcp::new(Session {
+        client: fake,
+        actor: "observer".into(),
+        read_only: true,
+    });
+    assert_eq!(info.tools().len(), 6);
+}
