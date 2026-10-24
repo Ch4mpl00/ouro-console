@@ -1,23 +1,24 @@
+mod common;
 use axum::{
     Router,
     body::Body,
     http::{Request as HttpRequest, StatusCode},
 };
+use common::{Backend, Fixture};
 use http_body_util::BodyExt;
 use ouro_console::{
     client::*,
-    fake::FakeControl,
     mcp::{Mcp, WRITES},
     web::{WebConfig, router},
 };
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, sync::Arc};
+use std::collections::BTreeSet;
 use tower::ServiceExt;
 
-fn setup(read_only: bool) -> (Router, Arc<FakeControl>) {
-    let fake = Arc::new(FakeControl::new());
+async fn setup(read_only: bool, backend: &Backend) -> (Router, Fixture) {
+    let fixture = Fixture::new(backend).await;
     let session = Session {
-        client: fake.clone(),
+        client: fixture.client.clone(),
         actor: "mcp-operator".into(),
         read_only,
     };
@@ -26,7 +27,7 @@ fn setup(read_only: bool) -> (Router, Arc<FakeControl>) {
             session,
             WebConfig::new("127.0.0.1:8090".parse().unwrap(), None, None).unwrap(),
         ),
-        fake,
+        fixture,
     )
 }
 async fn rpc(app: &Router, method: &str, params: Value) -> Value {
@@ -60,9 +61,8 @@ async fn rpc(app: &Router, method: &str, params: Value) -> Value {
 async fn call(app: &Router, name: &str, args: Value) -> Value {
     rpc(app, "tools/call", json!({"name":name,"arguments":args})).await
 }
-#[tokio::test]
-async fn streamable_http_initializes_and_lists_all_schemas() {
-    let (app, _) = setup(false);
+async fn streamable_http_initializes_and_lists_all_schemas(backend: Backend) {
+    let (app, _) = setup(false, &backend).await;
     let init = rpc(&app,"initialize",json!({"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"tests","version":"1"}})).await;
     assert!(
         init["result"]["capabilities"]["tools"].is_object(),
@@ -107,8 +107,7 @@ async fn streamable_http_initializes_and_lists_all_schemas() {
         }
     }
 }
-#[tokio::test]
-async fn every_tool_can_be_called_over_http_and_writes_are_real() {
+async fn every_tool_can_be_called_over_http_and_writes_are_real(backend: Backend) {
     for (name, args) in [
         ("list_runs", json!({"state":"running","limit":100})),
         ("inspect_run", json!({"run":"run-002"})),
@@ -145,18 +144,23 @@ async fn every_tool_can_be_called_over_http_and_writes_are_real() {
             json!({"run":"run-003","wait":"/decision","event":{"source":"tests","id":"event-1","type":"review.decision","data":{"decision":"approve"}},"reason":"reviewed","request_id":"test"}),
         ),
     ] {
-        let (app, fake) = setup(false);
+        let (app, fixture) = setup(false, &backend).await;
         if name == "resume_all" {
-            fake.emergency_stop(
-                &Request {
-                    id: "seed".into(),
-                    actor: "seed".into(),
-                    reason: "seed".into(),
-                },
-                true,
-            )
-            .await
-            .unwrap();
+            fixture
+                .emergency_stop(
+                    &Request {
+                        id: "seed".into(),
+                        actor: "seed".into(),
+                        reason: "seed".into(),
+                    },
+                    true,
+                )
+                .await
+                .unwrap();
+        }
+        let mut args = args;
+        if name == "respond" {
+            args["wait"] = json!(fixture.wait_key);
         }
         let reply = call(&app, name, args).await;
         assert!(reply.get("error").is_none(), "{name}: {reply}");
@@ -168,7 +172,7 @@ async fn every_tool_can_be_called_over_http_and_writes_are_real() {
             "{name}: {reply}"
         );
         if WRITES.contains(&name) {
-            let entry = fake.entry("test").await.unwrap().unwrap();
+            let entry = fixture.entry("test").await.unwrap().unwrap();
             assert_eq!(entry.request.actor, "mcp-operator");
             assert!(reply.to_string().contains("mcp-operator"));
         }
@@ -178,24 +182,50 @@ async fn every_tool_can_be_called_over_http_and_writes_are_real() {
                 assert!(!reply.to_string().contains("run-003"));
             }
             "cancel_run" | "cancel_tree" => assert_eq!(
-                fake.inspect("run-008").await.unwrap().unwrap().run.state,
+                fixture.inspect("run-008").await.unwrap().unwrap().run.state,
                 RunState::Cancelled
             ),
-            "pause_definition" => assert!(fake.definitions().await.unwrap()[0].tripped.is_some()),
-            "resume_definition" => assert!(fake.definitions().await.unwrap()[3].tripped.is_none()),
-            "stop_all" => assert!(fake.stopped().await.unwrap()),
-            "resume_all" => assert!(!fake.stopped().await.unwrap()),
-            "respond" => assert_eq!(
-                fake.inspect("run-003").await.unwrap().unwrap().run.state,
-                RunState::Ready
+            "pause_definition" => assert!(
+                fixture
+                    .definitions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .find(|d| d.name == "review")
+                    .unwrap()
+                    .tripped
+                    .is_some()
             ),
+            "resume_definition" => assert!(
+                fixture
+                    .definitions()
+                    .await
+                    .unwrap()
+                    .iter()
+                    .find(|d| d.name == "cleanup")
+                    .unwrap()
+                    .tripped
+                    .is_none()
+            ),
+            "stop_all" => assert!(fixture.stopped().await.unwrap()),
+            "resume_all" => assert!(!fixture.stopped().await.unwrap()),
+            "respond" => {
+                fixture.drive_answer().await;
+                assert_eq!(
+                    fixture.inspect("run-003").await.unwrap().unwrap().run.state,
+                    if fixture.is_real() {
+                        RunState::Completed
+                    } else {
+                        RunState::Ready
+                    }
+                );
+            }
             _ => {}
         }
     }
 }
-#[tokio::test]
-async fn mcp_rejects_missing_or_blank_reasons_for_every_write() {
-    let (app, _) = setup(false);
+async fn mcp_rejects_missing_or_blank_reasons_for_every_write(backend: Backend) {
+    let (app, fixture) = setup(false, &backend).await;
     for name in WRITES {
         let args = json!({"run":"run-003","wait":"/decision","definition":"review","event":{}});
         let reply = call(&app, name, args.clone()).await;
@@ -205,6 +235,10 @@ async fn mcp_rejects_missing_or_blank_reasons_for_every_write() {
         );
         let mut args = args;
         args["reason"] = json!(" ");
+        let mut args = args;
+        if name == "respond" {
+            args["wait"] = json!(fixture.wait_key);
+        }
         let reply = call(&app, name, args).await;
         assert!(
             reply.get("error").is_some() || reply["result"]["isError"] == true,
@@ -212,9 +246,8 @@ async fn mcp_rejects_missing_or_blank_reasons_for_every_write() {
         );
     }
 }
-#[tokio::test]
-async fn read_only_mcp_exposes_and_accepts_only_reads() {
-    let (app, fake) = setup(true);
+async fn read_only_mcp_exposes_and_accepts_only_reads(backend: Backend) {
+    let (app, fixture) = setup(true, &backend).await;
     let list = rpc(&app, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().unwrap();
     assert_eq!(tools.len(), 6);
@@ -226,11 +259,34 @@ async fn read_only_mcp_exposes_and_accepts_only_reads() {
             "{reply}"
         );
     }
-    assert!(!fake.stopped().await.unwrap());
+    assert!(!fixture.stopped().await.unwrap());
     let info = Mcp::new(Session {
-        client: fake,
+        client: fixture.client,
         actor: "observer".into(),
         read_only: true,
     });
     assert_eq!(info.tools().len(), 6);
+}
+
+common::backend_tests!(
+    streamable_http_initializes_and_lists_all_schemas,
+    every_tool_can_be_called_over_http_and_writes_are_real,
+    mcp_rejects_missing_or_blank_reasons_for_every_write,
+    read_only_mcp_exposes_and_accepts_only_reads
+);
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (isolated schemas)"]
+async fn postgres_errors_include_database_diagnosis_over_http() {
+    let backend = Backend::postgres();
+    let (app, _) = setup(false, &backend).await;
+    // Deliberately pass an invalid Postgres text value to exercise a real error chain.
+    let reply = call(&app, "inspect_run", json!({"run":"invalid\0id"})).await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "db error: ERROR: invalid byte sequence for encoding \"UTF8\": 0x00",
+        "{reply}"
+    );
+    backend.cleanup().await;
 }

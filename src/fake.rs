@@ -89,7 +89,7 @@ impl FakeControl {
             filters: json!({"type":"review.decision"}),
             expectations: json!({}),
             progress: json!({"filled":[],"remaining":1}),
-            position: 0,
+            position: "0".into(),
             since_ms: now - 210_000,
             timeout_ms: Some(now + 3_600_000),
             redacted: false,
@@ -121,7 +121,7 @@ impl FakeControl {
                         filters: json!({"type":"transform.signal"}),
                         expectations: json!({"subject":"sample-42"}),
                         progress: json!({"remaining":1}),
-                        position: 2,
+                        position: "2".into(),
                         since_ms: now - 60_000,
                         timeout_ms: Some(now + 600_000),
                         redacted: false,
@@ -346,6 +346,9 @@ fn paginate<T>(
 }
 #[async_trait]
 impl ControlClient for FakeControl {
+    fn backend_label(&self) -> &'static str {
+        "Fake backend · demo data resets on restart"
+    }
     async fn execute(&self, request: &Request, command: &Command) -> Result<Reply> {
         request.validate()?;
         let mut data = self.data()?;
@@ -601,22 +604,23 @@ impl ControlClient for FakeControl {
     async fn definitions(&self) -> Result<Vec<Definition>> {
         Ok(self.data()?.definitions.clone())
     }
-    async fn workers(&self) -> Result<Vec<Worker>> {
+    async fn workers(&self) -> Result<Workers> {
         let data = self.data()?;
-        Ok(data
-            .workers
-            .iter()
-            .cloned()
-            .map(|mut w| {
-                w.runs_held = data
-                    .runs
-                    .values()
-                    .filter(|i| i.lease.as_ref().is_some_and(|l| l.holder == w.id))
-                    .map(|i| i.run.id.clone())
-                    .collect();
-                w
-            })
-            .collect())
+        Ok(Workers::Available(
+            data.workers
+                .iter()
+                .cloned()
+                .map(|mut w| {
+                    w.runs_held = data
+                        .runs
+                        .values()
+                        .filter(|i| i.lease.as_ref().is_some_and(|l| l.holder == w.id))
+                        .map(|i| i.run.id.clone())
+                        .collect();
+                    w
+                })
+                .collect(),
+        ))
     }
 }
 
