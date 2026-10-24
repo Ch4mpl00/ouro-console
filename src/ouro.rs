@@ -27,6 +27,15 @@ impl OuroControl {
     }
     /// Writable adapters migrate on open. Read-only adapters require an existing schema.
     pub async fn connect(spec: &str, read_only: bool) -> Result<Self> {
+        if spec
+            .strip_prefix("sqlite:")
+            .or_else(|| spec.strip_prefix("postgres:"))
+            .is_none_or(|s| s.is_empty())
+        {
+            return Err(ControlError::Invalid(
+                "store must be sqlite:<path> or postgres:<url>".into(),
+            ));
+        }
         let backend: Arc<dyn AtomicBackend> = if read_only {
             Arc::new(
                 crate::readonly::ReadBackend::open(spec)
@@ -262,7 +271,14 @@ fn inspection(inspection: api::Inspection) -> Result<Inspection> {
                     ows::durable::Delivery::AtMostOnce => "at_most_once",
                 }
                 .into(),
-                state: value(call.state)?.as_str().unwrap_or("unknown").into(),
+                state: match call.state {
+                    ows::durable::CallStatus::Pending => "pending",
+                    ows::durable::CallStatus::Completed => "completed",
+                    ows::durable::CallStatus::Failed => "failed",
+                    ows::durable::CallStatus::NotExecuted => "not_executed",
+                    ows::durable::CallStatus::Unknown => "unknown",
+                }
+                .into(),
                 arguments,
                 result,
             })

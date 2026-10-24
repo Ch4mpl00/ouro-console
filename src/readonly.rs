@@ -118,7 +118,7 @@ impl Transaction for SqliteRead {
         limit: usize,
     ) -> anyhow::Result<Rows> {
         let (kind, start, end) = (kind.to_owned(), start.to_owned(), end.map(str::to_owned));
-        let limit = i64::try_from(limit)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.run(move |c| {
             let mut query = c.prepare("SELECT id,value FROM ouro_rows WHERE kind=?1 AND id>=?2 AND (?3 IS NULL OR id<?3) ORDER BY id LIMIT ?4")?;
             let rows = query.query_map(params![kind, start, end, limit], |r| Ok((r.get::<_,String>(0)?, r.get::<_,String>(1)?)))?;
@@ -155,7 +155,7 @@ impl Transaction for PostgresRead {
         end: Option<&str>,
         limit: usize,
     ) -> anyhow::Result<Rows> {
-        let limit = i64::try_from(limit)?;
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
         self.client.query("SELECT id,value FROM ouro_rows WHERE kind=$1 AND id>=$2 AND ($3::text IS NULL OR id<$3) ORDER BY id LIMIT $4", &[&kind, &start, &end, &limit]).await?
             .into_iter().map(|r| Ok(((kind.into(), r.get(0)), serde_json::from_str(&r.get::<_,String>(1))?))).collect()
     }

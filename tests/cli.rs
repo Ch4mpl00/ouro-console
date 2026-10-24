@@ -1,10 +1,10 @@
+mod common;
 use clap::Parser;
+use common::{Backend, Fixture};
 use ouro_console::{
     cli::{self, Action, Cli, TokenConfig},
     client::*,
-    fake::FakeControl,
 };
-use std::sync::Arc;
 #[test]
 fn parses_serve_defaults_and_global_options_after_subcommand() {
     let cli = Cli::try_parse_from([
@@ -68,11 +68,10 @@ fn every_script_command_parses_and_mutations_require_reason() {
     }
     assert!(Cli::try_parse_from(["ouro-console", "runs", "--state", "bogus"]).is_err());
 }
-#[tokio::test]
-async fn script_dispatch_uses_shared_client_and_read_only_policy() {
-    let fake = Arc::new(FakeControl::new());
+async fn script_dispatch_uses_shared_client_and_read_only_policy(backend: Backend) {
+    let fixture = Fixture::new(&backend).await;
     let mut session = Session {
-        client: fake.clone(),
+        client: fixture.client.clone(),
         actor: "script-operator".into(),
         read_only: false,
     };
@@ -94,7 +93,7 @@ async fn script_dispatch_uses_shared_client_and_read_only_policy() {
     .await
     .unwrap();
     assert_eq!(reply["request"]["actor"], "script-operator");
-    assert!(fake.stopped().await.unwrap());
+    assert!(fixture.stopped().await.unwrap());
     assert_eq!(
         cli::execute(&session, parse(vec!["status"])).await.unwrap(),
         true
@@ -134,3 +133,5 @@ fn token_configuration_rejects_empty_or_whitespace_values() {
     assert_eq!(config.actor.as_deref(), Some("file-actor"));
     assert_eq!(config.token, "file-secret");
 }
+
+common::backend_tests!(script_dispatch_uses_shared_client_and_read_only_policy);

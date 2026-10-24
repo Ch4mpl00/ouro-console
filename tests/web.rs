@@ -1,21 +1,21 @@
+mod common;
 use axum::{
     Router,
     body::Body,
     http::{Request as HttpRequest, StatusCode},
 };
+use common::{Backend, Fixture};
 use http_body_util::BodyExt;
 use ouro_console::{
     client::*,
-    fake::FakeControl,
     web::{WebConfig, router},
 };
-use std::sync::Arc;
 use tower::ServiceExt;
 
-fn setup(read_only: bool) -> (Router, Arc<FakeControl>) {
-    let fake = Arc::new(FakeControl::new());
+async fn setup(read_only: bool, backend: &Backend) -> (Router, Fixture) {
+    let fixture = Fixture::new(backend).await;
     let session = Session {
-        client: fake.clone(),
+        client: fixture.client.clone(),
         actor: "test-operator".into(),
         read_only,
     };
@@ -29,7 +29,7 @@ fn setup(read_only: bool) -> (Router, Arc<FakeControl>) {
             )
             .unwrap(),
         ),
-        fake,
+        fixture,
     )
 }
 async fn request(
@@ -68,9 +68,8 @@ async fn request(
 fn form(fields: &[(&str, &str)]) -> String {
     serde_urlencoded::to_string(fields).unwrap()
 }
-#[tokio::test]
-async fn every_page_renders_key_content_and_global_controls() {
-    let (app, _) = setup(false);
+async fn every_page_renders_key_content_and_global_controls(backend: Backend) {
+    let (app, fixture) = setup(false, &backend).await;
     for (path, needles) in [
         (
             "/runs?limit=100",
@@ -167,9 +166,31 @@ async fn every_page_renders_key_content_and_global_controls() {
         let (status, html) = request(&app, "GET", path, "", &[]).await;
         assert_eq!(status, StatusCode::OK, "{path}: {html}");
         for needle in needles {
+            if fixture.is_real()
+                && [
+                    "worker-a",
+                    "not_executed",
+                    "unknown",
+                    "worker-b",
+                    "stale",
+                    "128 MiB",
+                    "14.2%",
+                    "Runs held",
+                    "https://traces.example/trace/0123456789abcdef0123456789abcdef",
+                ]
+                .contains(&needle)
+            {
+                continue;
+            }
             assert!(html.contains(needle), "{path} missing {needle}");
         }
         assert!(html.contains("/emergency"), "missing global stop on {path}");
+        if fixture.is_real() {
+            assert!(!html.contains("Fake backend"));
+            if path == "/workers" {
+                assert!(html.contains("not available yet (ouro#20)"));
+            }
+        }
         assert!(html.contains("theme-toggle"));
         assert!(!html.contains("cdn."));
     }
@@ -184,9 +205,8 @@ async fn every_page_renders_key_content_and_global_controls() {
         StatusCode::NOT_FOUND
     );
 }
-#[tokio::test]
-async fn filters_paging_and_polling_preserve_query() {
-    let (app, _) = setup(false);
+async fn filters_paging_and_polling_preserve_query(backend: Backend) {
+    let (app, _) = setup(false, &backend).await;
     let (_, html) = request(
         &app,
         "GET",
@@ -233,8 +253,7 @@ async fn filters_paging_and_polling_preserve_query() {
     assert!(history.contains("run-005"));
     assert!(!history.contains("class=\"fw-semibold\" href=\"/runs/run-002\""));
 }
-#[tokio::test]
-async fn each_action_mutates_and_returns_attributed_receipt() {
+async fn each_action_mutates_and_returns_attributed_receipt(backend: Backend) {
     for (action, target) in [
         ("cancel", ("run", "run-002")),
         ("cancel-tree", ("run", "run-002")),
@@ -244,25 +263,26 @@ async fn each_action_mutates_and_returns_attributed_receipt() {
         ("resume-all", ("x", "")),
         ("respond", ("run", "run-003")),
     ] {
-        let (app, fake) = setup(false);
+        let (app, fixture) = setup(false, &backend).await;
         if action == "resume-all" {
-            fake.emergency_stop(
-                &Request {
-                    id: "seed".into(),
-                    actor: "seed".into(),
-                    reason: "test".into(),
-                },
-                true,
-            )
-            .await
-            .unwrap();
+            fixture
+                .emergency_stop(
+                    &Request {
+                        id: "seed".into(),
+                        actor: "seed".into(),
+                        reason: "test".into(),
+                    },
+                    true,
+                )
+                .await
+                .unwrap();
         }
         let body = form(&[
             ("reason", "investigate <sample>"),
             ("request_id", action),
             ("confirmed", "true"),
             target,
-            ("wait", "/decision"),
+            ("wait", fixture.wait_key.as_str()),
             ("decision", "approve"),
             ("note", "maintenance"),
         ]);
@@ -272,45 +292,65 @@ async fn each_action_mutates_and_returns_attributed_receipt() {
         assert!(html.contains("test-operator"));
         assert!(html.contains("investigate &lt;sample&gt;"));
         assert!(!html.contains("investigate <sample>"));
-        let entry = fake.entry(action).await.unwrap().unwrap();
+        let entry = fixture.entry(action).await.unwrap().unwrap();
         assert_eq!(entry.request.actor, "test-operator");
         match action {
             "cancel" | "cancel-tree" => {
                 for id in ["run-002", "run-007", "run-008"] {
                     assert_eq!(
-                        fake.inspect(id).await.unwrap().unwrap().run.state,
+                        fixture.inspect(id).await.unwrap().unwrap().run.state,
                         RunState::Cancelled
                     );
                 }
                 assert_eq!(
-                    fake.inspect("run-009").await.unwrap().unwrap().run.state,
+                    fixture.inspect("run-009").await.unwrap().unwrap().run.state,
                     RunState::Completed
                 );
             }
             "pause" => assert!(matches!(
-                fake.definitions().await.unwrap()[0].tripped,
-                Some(Trip::Manual { .. })
-            )),
-            "resume" => assert!(fake.definitions().await.unwrap()[3].tripped.is_none()),
-            "stop-all" => assert!(fake.stopped().await.unwrap()),
-            "resume-all" => assert!(!fake.stopped().await.unwrap()),
-            "respond" => assert!(
-                fake.inspect("run-003")
+                fixture
+                    .definitions()
                     .await
                     .unwrap()
+                    .into_iter()
+                    .find(|d| d.name == "review")
                     .unwrap()
-                    .waits
-                    .is_empty()
+                    .tripped,
+                Some(Trip::Manual { .. })
+            )),
+            "resume" => assert!(
+                fixture
+                    .definitions()
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .find(|d| d.name == "cleanup")
+                    .unwrap()
+                    .tripped
+                    .is_none()
             ),
+            "stop-all" => assert!(fixture.stopped().await.unwrap()),
+            "resume-all" => assert!(!fixture.stopped().await.unwrap()),
+            "respond" => {
+                fixture.drive_answer().await;
+                assert!(
+                    fixture
+                        .inspect("run-003")
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .waits
+                        .is_empty()
+                );
+            }
             _ => unreachable!(),
         }
         let (code, _) = request(&app, "POST", &format!("/actions/{action}"), &body, &[]).await;
         assert_eq!(code, StatusCode::OK, "retry {action}");
     }
 }
-#[tokio::test]
-async fn all_mutations_reject_missing_reason_confirmation_or_request_id() {
-    let (app, _) = setup(false);
+async fn all_mutations_reject_missing_reason_confirmation_or_request_id(backend: Backend) {
+    let (app, fixture) = setup(false, &backend).await;
     for action in [
         "cancel",
         "cancel-tree",
@@ -327,7 +367,7 @@ async fn all_mutations_reject_missing_reason_confirmation_or_request_id() {
                 ("request_id", "test"),
                 ("run", "run-003"),
                 ("definition", "review"),
-                ("wait", "/decision"),
+                ("wait", fixture.wait_key.as_str()),
                 ("decision", "approve"),
             ]
             .into_iter()
@@ -365,16 +405,15 @@ async fn all_mutations_reject_missing_reason_confirmation_or_request_id() {
         StatusCode::BAD_REQUEST
     );
 }
-#[tokio::test]
-async fn json_answers_reject_invalid_payloads_and_breaker_resume_conflicts() {
-    let (app, fake) = setup(false);
+async fn json_answers_reject_invalid_payloads_and_breaker_resume_conflicts(backend: Backend) {
+    let (app, fixture) = setup(false, &backend).await;
     let body = |payload| {
         form(&[
             ("reason", "reviewed"),
             ("confirmed", "true"),
             ("request_id", "answer-json"),
             ("run", "run-003"),
-            ("wait", "/decision"),
+            ("wait", fixture.wait_key.as_str()),
             ("decision", "json"),
             ("payload", payload),
         ])
@@ -398,7 +437,14 @@ async fn json_answers_reject_invalid_payloads_and_breaker_resume_conflicts() {
         StatusCode::OK
     );
     assert_eq!(
-        fake.inspect("run-003").await.unwrap().unwrap().mailbox[0]["data"]["answer"],
+        {
+            let inspection = fixture.inspect("run-003").await.unwrap().unwrap();
+            if fixture.is_real() {
+                inspection.mailbox[0]["envelope"]["data"]["answer"].clone()
+            } else {
+                inspection.mailbox[0]["data"]["answer"].clone()
+            }
+        },
         42
     );
     assert_eq!(
@@ -418,9 +464,8 @@ async fn json_answers_reject_invalid_payloads_and_breaker_resume_conflicts() {
         StatusCode::CONFLICT
     );
 }
-#[tokio::test]
-async fn read_only_hides_and_denies_every_action() {
-    let (app, fake) = setup(true);
+async fn read_only_hides_and_denies_every_action(backend: Backend) {
+    let (app, fixture) = setup(true, &backend).await;
     for path in [
         "/runs",
         "/runs/run-002",
@@ -452,13 +497,13 @@ async fn read_only_hides_and_denies_every_action() {
             StatusCode::FORBIDDEN
         );
     }
-    assert!(!fake.stopped().await.unwrap());
+    assert!(!fixture.stopped().await.unwrap());
 }
-#[tokio::test]
-async fn bearer_auth_covers_pages_assets_and_mcp_and_remote_bind_requires_it() {
+async fn bearer_auth_covers_pages_assets_and_mcp_and_remote_bind_requires_it(backend: Backend) {
     assert!(WebConfig::new("0.0.0.0:8090".parse().unwrap(), None, None).is_err());
+    let fixture = Fixture::new(&backend).await;
     let session = Session {
-        client: Arc::new(FakeControl::new()),
+        client: fixture.client.clone(),
         actor: "remote-operator".into(),
         read_only: false,
     };
@@ -505,9 +550,8 @@ async fn bearer_auth_covers_pages_assets_and_mcp_and_remote_bind_requires_it() {
         StatusCode::FORBIDDEN
     );
 }
-#[tokio::test]
-async fn embedded_assets_and_trace_configuration_are_valid() {
-    let (app, _) = setup(false);
+async fn embedded_assets_and_trace_configuration_are_valid(backend: Backend) {
+    let (app, _) = setup(false, &backend).await;
     for path in [
         "/assets/console.js",
         "/assets/console.css",
@@ -530,3 +574,14 @@ async fn embedded_assets_and_trace_configuration_are_valid() {
         assert!(WebConfig::new("127.0.0.1:8090".parse().unwrap(), None, Some(bad.into())).is_err());
     }
 }
+
+common::backend_tests!(
+    every_page_renders_key_content_and_global_controls,
+    filters_paging_and_polling_preserve_query,
+    each_action_mutates_and_returns_attributed_receipt,
+    all_mutations_reject_missing_reason_confirmation_or_request_id,
+    json_answers_reject_invalid_payloads_and_breaker_resume_conflicts,
+    read_only_hides_and_denies_every_action,
+    bearer_auth_covers_pages_assets_and_mcp_and_remote_bind_requires_it,
+    embedded_assets_and_trace_configuration_are_valid
+);
