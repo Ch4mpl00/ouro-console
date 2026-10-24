@@ -9,8 +9,8 @@ Postgres store. Web, MCP, and separate CLI processes address the same persistent
 state when configured with the same store. The console observes and controls
 runs; the embedding ouro host still admits and drives workflows.
 
-`ouro-runtime` and `ouro-durable` are pinned to Git revision `2bd26cd`
-(`2bd26cdeaf53ea0a664fdfbbef31a4898b872dce`). `ows` types come through
+`ouro-runtime` and `ouro-durable` are pinned to Git revision `083d7dc`
+(`083d7dc4d0600a15e49b4da73a73fec46c4191d9`). `ows` types come through
 `ouro-runtime`'s reexport. `--fake` remains available for process-local demos.
 
 ## Run
@@ -68,22 +68,20 @@ for database permissions or deployment authentication.
 
 The demo includes `review`, `transform`, `archive`, and `cleanup` definitions,
 every run state, a three-level owned tree, open decision/signal waits, an
-automatic breaker trip, a manual pause, and healthy/stale heartbeat snapshots.
-Demo actions last until that process exits;
+automatic breaker trip, a manual pause, annotated calls with token counts, and
+live/stale worker heartbeat rows. Demo actions last until that process exits;
 a separate demo CLI process does not affect a demo server. The fake executes no
-workflows or heartbeat updates. Real stores currently have no worker heartbeat
-rows: `/workers`, `workers`, and `list_workers` explicitly report **not available
-yet (ouro#20)**. The trait method remains available for future support.
+workflows or heartbeat updates.
 
 ## Web UI
 
 | Route | Contents |
 | --- | --- |
 | `/runs` | Definition/state/age filters, admission or terminal history, cursor paging, 2-second htmx refresh, cancel links |
-| `/runs/{id}` | State/version, lease holder and expiry, exact waits, call journal with delivery/states/arguments/results, jump budget, owned descendants including ended children, mailbox, configured trace link, cancel/cancel tree |
+| `/runs/{id}` | State/version, lease holder and expiry, exact waits, usage (the run's annotation totals, `gen_ai.usage.input_tokens`/`output_tokens` first), call journal with delivery/states/annotations/arguments/results, jump budget, owned descendants including ended children, mailbox, pinned trace/span ids with the configured trace link, cancel/cancel tree |
 | `/pending` | What runs wait for, matcher/progress/correlation expectations, since time, absolute timeout, approve/reject or JSON data answers |
-| `/definitions` | Versions, active version, epoch, fault count, automatic breaker/manual pause attribution, schedule, pause/resume |
-| `/workers` | Explicit unavailable state for real stores until ouro#20; heartbeat/resource snapshots in demos |
+| `/definitions` | Paged: versions, active version, epoch, fault count, automatic breaker/manual pause attribution and time, each schedule kind with next due time, overlap, catch-up and queued slot, pause/resume |
+| `/workers` | Paged heartbeat rows: live/stale, last beat and expiry, runs held, application version, host, start |
 | `/journal` | Request ID, actor, reason, command, committed reply; optional `?run=…` |
 | `/emergency` | Always accessible from the red header control; current stop flag, confirmed stop/resume with required reason |
 
@@ -149,12 +147,13 @@ client. Set the bearer authorization header in your MCP client's transport
 configuration when a token is configured.
 
 Read tools: `list_runs`, `inspect_run`, `run_log`, `list_pending`,
-`list_definitions`, `list_workers`.
+`list_definitions`, `get_definition`, `list_workers`. `list_definitions` and
+`list_workers` take `cursor` and `limit`; `get_definition` takes `definition`.
 
 Mutating tools: `respond`, `cancel_run`, `cancel_tree`, `pause_definition`,
 `resume_definition`, `stop_all`, `resume_all`. All require a nonempty `reason`;
 provide `request_id` for reliable retries. They return the request, command,
-timestamp, and reply as JSON. Read-only mode registers only the six reads and
+timestamp, and reply as JSON. Read-only mode registers only the seven reads and
 refuses attempts to call writes. Inputs have generated JSON Schemas.
 
 `list_runs` accepts the run filters above (absolute milliseconds), `history`,
@@ -199,8 +198,9 @@ ouro-console history --since-ms 0 --before-ms 1800000000000
 ouro-console inspect run-002
 ouro-console run-log run-002
 ouro-console pending --event-type review.decision
-ouro-console definitions
-ouro-console workers
+ouro-console definitions --limit 50
+ouro-console definition review
+ouro-console workers --limit 50
 ouro-console journal --run run-002
 ouro-console counts --definition review --limit 50
 ouro-console status
@@ -223,7 +223,7 @@ supports definition, run, event type, time bounds, and cursor. Counts supports
 
 - `src/client.rs`: console-owned DTOs, object-safe async `ControlClient`, shared
   authorization/attribution `Session`, errors.
-- `src/ouro.rs`: typed control/store adapter, opaque cursor transport, definition catalog.
+- `src/ouro.rs`: adapter from ouro's `Control` to the console's types, opaque cursor transport.
 - `src/readonly.rs`: non-migrating read-only database transports for ouro's transaction seam.
 - `src/fake.rs`: process-local fixtures, atomic state changes, query-bound
   continuations, audit and response identity deduplication.
@@ -246,8 +246,13 @@ there are no runtime filesystem asset dependencies.
 The console keeps its own view types. Numeric ouro version IDs are displayed as
 strings (`"none"` for an inactive definition). All six run states, lease
 ownership/expiry, call arguments/results and delivery states, mailbox metadata,
-owned descendants, budget evidence and existing trace/span IDs are projected
-from `Control::inspect`. No trace IDs or worker records are invented. Wait
+owned descendants, budget evidence, per-call annotations and the run's
+annotation totals, and the trace/span IDs pinned at admission are projected
+from `Control::inspect`. No trace IDs or worker records are invented.
+Annotations are shown as ouro stores them: the GenAI token counts
+(`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`) are displayed
+first, every other name as a key/value. The runs list has no tokens column:
+saved runs carry no annotation totals, so it would take one inspection per row. Wait
 positions remain strings; strategies, matcher filters and incremental progress
 are displayed without evaluating expressions. Complex or wildcard responses
 can be submitted as complete CloudEvents through MCP/CLI. A response becomes
@@ -262,13 +267,14 @@ as `anyhow` messages: known messages map to invalid/not-found/conflict errors;
 unknown storage failures remain internal errors. Storage error text includes the
 underlying cause chain, including Postgres's database diagnosis.
 
-`RunStore::definitions(name)` provides versions, active version, epoch, faults
-and manual/automatic trips. At this pin it has no name-list API, so catalog
-names are scanned through the public `AtomicBackend` seam in chunks of 256,
-then decoded using the definitions API. Schedule JSON comes from the active
-version's parsed definition. Catalog entries can change between observations.
-
-Worker heartbeats/resources remain unavailable until [ouro#20](https://github.com/Ch4mpl00/ouro/issues/20).
+Definitions come from `Control::definitions` (bounded pages in binary name
+order, each page one transaction) and `Control::definition`. The console reads
+no store rows and knows no key layout; the only code below `Control` is the
+read-only transport, which exists because ouro's constructors migrate.
+`activated_ms` is shown when ouro records it (the current catalog does not).
+Workers come from `Control::workers`: one heartbeat row per worker, stale when
+it did not beat again before its expiry by ouro's clock. Process memory and
+CPU are not in the rows; ouro leaves them to an outside process exporter.
 Version activation, workflow editing, metrics dashboards and host-specific views
 remain outside v1. The console does not run a workflow worker. Store-only
 cancellation changes durable state; the host observes it at its execution gates.
@@ -301,9 +307,11 @@ cargo test
 
 The existing page/action, MCP transport and CLI dispatch suites run against
 both `FakeControl` and `OuroControl` on temporary SQLite files. Real fixtures
-use ouro's `Runtime` to save/activate definitions, admit and drive workflows,
-create owned children, pause a definition, and cancel a run. A persisted lease
-provides a running view. Tests also cover independent-process CLI selection,
+use ouro's `Runtime` to save/activate definitions, admit and drive workflows
+(one function answers annotated output with GenAI token counts; two runs are
+admitted inside a known span context), create owned children, pause a
+definition, cancel a run, and write heartbeat rows from two runtimes, one of
+them stale. A persisted lease provides a running view. Tests also cover independent-process CLI selection,
 opaque paging, mapping/error behavior, read-only non-migration, and HTTP actions
 observed through ouro's API, including driving a responded wait to completion.
 

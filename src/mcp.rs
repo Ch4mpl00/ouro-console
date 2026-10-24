@@ -66,6 +66,15 @@ pub struct ListPending {
     pub limit: Option<usize>,
 }
 #[derive(Deserialize, JsonSchema)]
+pub struct ListPage {
+    pub cursor: Option<Cursor>,
+    pub limit: Option<usize>,
+}
+#[derive(Deserialize, JsonSchema)]
+pub struct DefinitionInput {
+    pub definition: String,
+}
+#[derive(Deserialize, JsonSchema)]
 pub struct RunInput {
     pub run: String,
 }
@@ -133,7 +142,7 @@ impl Mcp {
         })
     }
     #[tool(
-        description = "Inspect state, lease, waits, mailbox, calls, owned children and jump budget.",
+        description = "Inspect state, lease, waits, mailbox, calls with their annotations, per-run annotation totals (gen_ai.usage.input_tokens/output_tokens), owned children, jump budget and pinned trace/span ids.",
         annotations(read_only_hint = true)
     )]
     async fn inspect_run(
@@ -143,7 +152,7 @@ impl Mcp {
         output(self.session.client.inspect(&p.run).await)
     }
     #[tool(
-        description = "Read a run's call journal with delivery and outcome states.",
+        description = "Read a run's call journal with delivery, outcome states and per-call annotations.",
         annotations(read_only_hint = true)
     )]
     async fn run_log(
@@ -188,18 +197,52 @@ impl Mcp {
         .await
     }
     #[tool(
-        description = "List immutable definition versions, active version, breaker, manual pause and schedule.",
+        description = "Page definitions in name order: versions, active version, epoch, breaker (including manual pause attribution) and schedules with next due times.",
         annotations(read_only_hint = true)
     )]
-    async fn list_definitions(&self) -> std::result::Result<CallToolResult, ErrorData> {
-        output(self.session.client.definitions().await)
+    async fn list_definitions(
+        &self,
+        Parameters(p): Parameters<ListPage>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        output(
+            self.session
+                .client
+                .definitions(p.cursor.as_ref(), p.limit.unwrap_or(50))
+                .await,
+        )
     }
     #[tool(
-        description = "List worker heartbeats, RSS, CPU and leased runs.",
+        description = "Read one definition's summary: versions, active version, epoch, breaker and schedules.",
         annotations(read_only_hint = true)
     )]
-    async fn list_workers(&self) -> std::result::Result<CallToolResult, ErrorData> {
-        output(self.session.client.workers().await)
+    async fn get_definition(
+        &self,
+        Parameters(p): Parameters<DefinitionInput>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        output(
+            self.session
+                .client
+                .definition(&p.definition)
+                .await
+                .and_then(|d| {
+                    d.ok_or_else(|| ControlError::NotFound("definition not found".into()))
+                }),
+        )
+    }
+    #[tool(
+        description = "Page worker heartbeat rows: liveness (stale when no beat before expiry), last beat, runs held, application version and host.",
+        annotations(read_only_hint = true)
+    )]
+    async fn list_workers(
+        &self,
+        Parameters(p): Parameters<ListPage>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        output(
+            self.session
+                .client
+                .workers(p.cursor.as_ref(), p.limit.unwrap_or(50))
+                .await,
+        )
     }
     #[tool(
         description = "Cancel a run and all transitive owned descendants atomically. Cannot retract dispatched effects."
@@ -271,7 +314,12 @@ impl Mcp {
 impl ServerHandler for Mcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
-            .with_server_info(Implementation::new("ouro-console", env!("CARGO_PKG_VERSION")))
-            .with_instructions("ouro operations console. Mutations require reason; use request_id for safe retry. Worker availability is reported explicitly by the backend.")
+            .with_server_info(Implementation::new(
+                "ouro-console",
+                env!("CARGO_PKG_VERSION"),
+            ))
+            .with_instructions(
+                "ouro operations console. Mutations require reason; use request_id for safe retry.",
+            )
     }
 }

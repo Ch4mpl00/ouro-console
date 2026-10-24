@@ -32,10 +32,9 @@ async fn owned_tree_cancellation_keeps_terminal_evidence_and_independent_runs() 
             .calls
             .is_empty()
     );
-    let Workers::Available(workers) = c.workers().await.unwrap() else {
-        panic!("fake workers unavailable")
-    };
-    assert!(workers[0].runs_held.is_empty());
+    let workers = c.workers(None, 10).await.unwrap().items;
+    assert_eq!(workers[0].held, 0);
+    assert!(!workers[0].stale && workers[1].stale);
 }
 #[tokio::test]
 async fn commands_replay_original_reply_and_reject_conflicting_ids() {
@@ -71,9 +70,9 @@ async fn commands_replay_original_reply_and_reject_conflicting_ids() {
 #[tokio::test]
 async fn pause_resume_preserves_epoch_breaker_counts_and_automatic_trip() {
     let c = FakeControl::new();
-    let before = c.definitions().await.unwrap()[3].clone();
+    let before = c.definition("cleanup").await.unwrap().unwrap();
     c.resume(&req("resume"), "cleanup").await.unwrap();
-    let after = c.definitions().await.unwrap()[3].clone();
+    let after = c.definition("cleanup").await.unwrap().unwrap();
     assert_eq!(before.epoch, after.epoch);
     assert_eq!(before.faults, after.faults);
     assert!(after.tripped.is_none());

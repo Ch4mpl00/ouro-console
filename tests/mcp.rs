@@ -81,6 +81,7 @@ async fn streamable_http_initializes_and_lists_all_schemas(backend: Backend) {
             "list_pending",
             "respond",
             "list_definitions",
+            "get_definition",
             "list_workers",
             "cancel_run",
             "cancel_tree",
@@ -113,7 +114,8 @@ async fn every_tool_can_be_called_over_http_and_writes_are_real(backend: Backend
         ("inspect_run", json!({"run":"run-002"})),
         ("run_log", json!({"run":"run-002"})),
         ("list_pending", json!({"event_type":"review.decision"})),
-        ("list_definitions", json!({})),
+        ("list_definitions", json!({"limit": 10})),
+        ("get_definition", json!({"definition": "cleanup"})),
         ("list_workers", json!({})),
         (
             "cancel_run",
@@ -181,28 +183,57 @@ async fn every_tool_can_be_called_over_http_and_writes_are_real(backend: Backend
                 assert!(reply.to_string().contains("run-002"));
                 assert!(!reply.to_string().contains("run-003"));
             }
+            "inspect_run" | "run_log" => {
+                let text = reply.to_string();
+                assert!(text.contains("gen_ai.usage.input_tokens"), "{text}");
+                assert!(text.contains("model-a"), "{text}");
+                if name == "inspect_run" {
+                    assert!(text.contains(common::TRACE_ID), "{text}");
+                }
+            }
+            "list_definitions" => {
+                let text = reply.to_string();
+                for name in ["archive", "cleanup", "review", "transform"] {
+                    assert!(text.contains(name), "{text}");
+                }
+            }
+            "get_definition" => {
+                let text = reply.to_string();
+                assert!(
+                    text.contains("demo-operator") && text.contains("every"),
+                    "{text}"
+                );
+            }
+            "list_workers" => {
+                let content: Value =
+                    serde_json::from_str(reply["result"]["content"][0]["text"].as_str().unwrap())
+                        .unwrap();
+                let items = content["items"].as_array().unwrap();
+                let worker = |id: &str| items.iter().find(|w| w["id"] == id).unwrap().clone();
+                let live = worker(&fixture.live_worker);
+                assert_eq!(live["stale"], false, "{live}");
+                assert_eq!(live["host"], "host-a");
+                assert_eq!(live["application"], "1.4.0");
+                assert_eq!(worker(&fixture.stale_worker)["stale"], true);
+            }
             "cancel_run" | "cancel_tree" => assert_eq!(
                 fixture.inspect("run-008").await.unwrap().unwrap().run.state,
                 RunState::Cancelled
             ),
             "pause_definition" => assert!(
                 fixture
-                    .definitions()
+                    .definition("review")
                     .await
                     .unwrap()
-                    .iter()
-                    .find(|d| d.name == "review")
                     .unwrap()
                     .tripped
                     .is_some()
             ),
             "resume_definition" => assert!(
                 fixture
-                    .definitions()
+                    .definition("cleanup")
                     .await
                     .unwrap()
-                    .iter()
-                    .find(|d| d.name == "cleanup")
                     .unwrap()
                     .tripped
                     .is_none()
@@ -250,7 +281,7 @@ async fn read_only_mcp_exposes_and_accepts_only_reads(backend: Backend) {
     let (app, fixture) = setup(true, &backend).await;
     let list = rpc(&app, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 6);
+    assert_eq!(tools.len(), 7);
     for name in WRITES {
         assert!(!tools.iter().any(|t| t["name"] == name));
         let reply = call(&app, name, json!({"reason":"attempt"})).await;
@@ -260,12 +291,16 @@ async fn read_only_mcp_exposes_and_accepts_only_reads(backend: Backend) {
         );
     }
     assert!(!fixture.stopped().await.unwrap());
+    assert_eq!(
+        call(&app, "get_definition", json!({"definition":"missing"})).await["result"]["isError"],
+        true
+    );
     let info = Mcp::new(Session {
         client: fixture.client,
         actor: "observer".into(),
         read_only: true,
     });
-    assert_eq!(info.tools().len(), 6);
+    assert_eq!(info.tools().len(), 7);
 }
 
 common::backend_tests!(
@@ -282,6 +317,7 @@ async fn postgres_errors_include_database_diagnosis_over_http() {
     let (app, _) = setup(false, &backend).await;
     // Deliberately pass an invalid Postgres text value to exercise a real error chain.
     let reply = call(&app, "inspect_run", json!({"run":"invalid\0id"})).await;
+
     assert_eq!(reply["result"]["isError"], true, "{reply}");
     assert_eq!(
         reply["result"]["content"][0]["text"],

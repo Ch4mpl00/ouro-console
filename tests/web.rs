@@ -98,6 +98,13 @@ async fn every_page_renders_key_content_and_global_controls(backend: Backend) {
                 "run-008",
                 "run-009",
                 "https://traces.example/trace/0123456789abcdef0123456789abcdef",
+                "Usage",
+                "Input tokens",
+                "Output tokens",
+                "gen_ai.usage.input_tokens",
+                "gen_ai.usage.output_tokens",
+                "model-a",
+                "Annotations",
             ],
         ),
         (
@@ -131,17 +138,23 @@ async fn every_page_renders_key_content_and_global_controls(backend: Backend) {
                 "demo-operator",
                 "resume after review",
                 "Schedule",
+                "every",
+                "suspended",
+                "Overlap skip",
             ],
         ),
         (
             "/workers",
             vec![
-                "worker-a",
-                "worker-b",
+                "live",
                 "stale",
-                "128 MiB",
-                "14.2%",
+                "Last beat",
                 "Runs held",
+                "Application version",
+                "1.4.0",
+                "1.3.2",
+                "host-a",
+                "host-b",
             ],
         ),
         (
@@ -166,30 +179,18 @@ async fn every_page_renders_key_content_and_global_controls(backend: Backend) {
         let (status, html) = request(&app, "GET", path, "", &[]).await;
         assert_eq!(status, StatusCode::OK, "{path}: {html}");
         for needle in needles {
-            if fixture.is_real()
-                && [
-                    "worker-a",
-                    "not_executed",
-                    "unknown",
-                    "worker-b",
-                    "stale",
-                    "128 MiB",
-                    "14.2%",
-                    "Runs held",
-                    "https://traces.example/trace/0123456789abcdef0123456789abcdef",
-                ]
-                .contains(&needle)
-            {
+            if fixture.is_real() && ["worker-a", "not_executed", "unknown"].contains(&needle) {
                 continue;
             }
             assert!(html.contains(needle), "{path} missing {needle}");
         }
         assert!(html.contains("/emergency"), "missing global stop on {path}");
+        if path == "/workers" {
+            assert!(html.contains(&fixture.live_worker), "{html}");
+            assert!(html.contains(&fixture.stale_worker), "{html}");
+        }
         if fixture.is_real() {
             assert!(!html.contains("Fake backend"));
-            if path == "/workers" {
-                assert!(html.contains("not available yet (ouro#20)"));
-            }
         }
         assert!(html.contains("theme-toggle"));
         assert!(!html.contains("cdn."));
@@ -206,7 +207,7 @@ async fn every_page_renders_key_content_and_global_controls(backend: Backend) {
     );
 }
 async fn filters_paging_and_polling_preserve_query(backend: Backend) {
-    let (app, _) = setup(false, &backend).await;
+    let (app, fixture) = setup(false, &backend).await;
     let (_, html) = request(
         &app,
         "GET",
@@ -248,6 +249,30 @@ async fn filters_paging_and_polling_preserve_query(backend: Backend) {
             .0,
         StatusCode::BAD_REQUEST
     );
+    // Definition and worker pages follow the backend's continuation.
+    let follow = |html: &str| {
+        html.split("href=\"")
+            .filter_map(|s| s.split('"').next())
+            .find(|s| s.contains("cursor="))
+            .expect("next page link")
+            .replace("&amp;", "&")
+    };
+    let title = |name: &str| format!("<h2 class=\"card-title\">{name}</h2>");
+    let (_, first) = request(&app, "GET", "/definitions?limit=3", "", &[]).await;
+    assert!(first.contains(&title("archive")) && !first.contains(&title("transform")));
+    let (code, rest) = request(&app, "GET", &follow(&first), "", &[]).await;
+    assert_eq!(code, StatusCode::OK, "{rest}");
+    assert!(rest.contains(&title("transform")) && !rest.contains(&title("archive")));
+    let workers = [fixture.live_worker.as_str(), fixture.stale_worker.as_str()];
+    let (_, first) = request(&app, "GET", "/workers?limit=1", "", &[]).await;
+    let (code, rest) = request(&app, "GET", &follow(&first), "", &[]).await;
+    assert_eq!(code, StatusCode::OK, "{rest}");
+    for id in workers {
+        assert!(
+            first.contains(id) != rest.contains(id),
+            "{id} on exactly one page"
+        );
+    }
     let (_, history) = request(&app, "GET", "/runs?history=true&limit=100", "", &[]).await;
     assert!(history.contains("Terminal history"));
     assert!(history.contains("run-005"));
@@ -308,23 +333,14 @@ async fn each_action_mutates_and_returns_attributed_receipt(backend: Backend) {
                 );
             }
             "pause" => assert!(matches!(
-                fixture
-                    .definitions()
-                    .await
-                    .unwrap()
-                    .into_iter()
-                    .find(|d| d.name == "review")
-                    .unwrap()
-                    .tripped,
+                fixture.definition("review").await.unwrap().unwrap().tripped,
                 Some(Trip::Manual { .. })
             )),
             "resume" => assert!(
                 fixture
-                    .definitions()
+                    .definition("cleanup")
                     .await
                     .unwrap()
-                    .into_iter()
-                    .find(|d| d.name == "cleanup")
                     .unwrap()
                     .tripped
                     .is_none()
