@@ -230,20 +230,36 @@ async fn opaque_paging_mappings_and_error_classification(backend: Backend) {
             .states["running"],
         1
     );
-    let definitions = fixture.definitions().await.unwrap();
-    let review = definitions.iter().find(|d| d.name == "review").unwrap();
-    assert_eq!(review.versions, ["1", "2"]);
-    assert_eq!(review.active, "2");
-    assert_eq!(review.epoch, 2);
+    let definitions = fixture.definitions(None, 100).await.unwrap().items;
     assert_eq!(
         definitions
             .iter()
-            .find(|d| d.name == "cleanup")
-            .unwrap()
-            .schedule
-            .as_deref(),
-        Some(r#"{"every":"PT1H"}"#)
+            .map(|d| d.name.as_str())
+            .collect::<Vec<_>>(),
+        ["archive", "cleanup", "review", "transform"]
     );
+    let review = definitions.iter().find(|d| d.name == "review").unwrap();
+    assert_eq!(
+        review
+            .versions
+            .iter()
+            .map(|v| v.version.as_str())
+            .collect::<Vec<_>>(),
+        ["1", "2"]
+    );
+    assert_eq!(review.active.as_deref(), Some("2"));
+    assert_eq!(review.epoch, 2);
+    assert!(review.schedules.is_empty());
+    // A manual pause keeps the suspended trigger's next due time.
+    let cleanup = fixture.definition("cleanup").await.unwrap().unwrap();
+    assert_eq!(cleanup.schedules.len(), 1);
+    assert_eq!(cleanup.schedules[0].kind, "every");
+    assert!(cleanup.schedules[0].next_due_ms.is_some());
+    assert!(fixture.definition("missing").await.unwrap().is_none());
+    let first = fixture.definitions(None, 3).await.unwrap();
+    let rest = fixture.definitions(first.next.as_ref(), 3).await.unwrap();
+    assert_eq!(rest.items[0].name, "transform");
+    assert!(rest.next.is_none());
     let empty = fixture
         .list(
             &Runs {
@@ -337,12 +353,69 @@ async fn opaque_paging_mappings_and_error_classification(backend: Backend) {
             .tripped,
         Some(Trip::Manual { .. })
     ));
-    assert!(
-        matches!(fixture.workers().await.unwrap(), Workers::Unavailable { reason } if reason.contains("ouro#20"))
+    let workers = fixture.workers(None, 10).await.unwrap();
+    assert!(workers.next.is_none());
+    let live = workers
+        .items
+        .iter()
+        .find(|w| w.id == fixture.live_worker)
+        .unwrap();
+    assert!(!live.stale);
+    assert_eq!(live.host.as_deref(), Some("host-a"));
+    assert_eq!(live.application.as_deref(), Some("1.4.0"));
+    assert_eq!(live.held, 0);
+    assert!(live.beat_ms <= now_ms() && live.expires_ms > now_ms());
+    let stale = workers
+        .items
+        .iter()
+        .find(|w| w.id == fixture.stale_worker)
+        .unwrap();
+    assert!(stale.stale);
+    assert_eq!(stale.host.as_deref(), Some("host-b"));
+    assert_eq!(stale.application.as_deref(), Some("1.3.2"));
+    assert_eq!(workers.items.len(), 2);
+    let paged = fixture.workers(None, 1).await.unwrap();
+    assert_eq!(paged.items.len(), 1);
+    assert_eq!(
+        fixture
+            .workers(paged.next.as_ref(), 1)
+            .await
+            .unwrap()
+            .items
+            .len(),
+        1
     );
     let inspection = fixture.inspect("run-003").await.unwrap().unwrap();
     assert_eq!(inspection.run.version, "2");
-    assert!(inspection.trace_id.is_none());
+    assert_eq!(inspection.trace_id.as_deref(), Some(common::TRACE_ID));
+    assert_eq!(inspection.span_id.as_deref(), Some(common::SPAN_ID));
+    assert!(
+        fixture
+            .inspect("run-001")
+            .await
+            .unwrap()
+            .unwrap()
+            .trace_id
+            .is_none()
+    );
+    assert_eq!(
+        inspection.annotations["gen_ai.usage.input_tokens"],
+        common::INPUT_TOKENS.into()
+    );
+    assert_eq!(
+        inspection.annotations["gen_ai.usage.output_tokens"],
+        common::OUTPUT_TOKENS.into()
+    );
+    // Text annotations stay on the call; only numbers are totalled.
+    assert!(!inspection.annotations.contains_key("gen_ai.request.model"));
+    assert_eq!(
+        inspection.calls[0].annotations["gen_ai.request.model"],
+        "model-a"
+    );
+    assert_eq!(
+        inspection.calls[0].annotations["gen_ai.usage.input_tokens"],
+        common::INPUT_TOKENS
+    );
     assert_eq!(inspection.calls.len(), 1);
     assert_eq!(inspection.calls[0].arguments, json!({"marker":"original"}));
     assert_eq!(
@@ -477,7 +550,18 @@ async fn read_only_connection_reads_without_mutating_or_migrating(backend: Backe
         json!({"marker":"original"})
     );
     assert!(client.inspect("missing").await.unwrap().is_none());
-    assert_eq!(client.definitions().await.unwrap().len(), 4);
+    assert_eq!(client.definitions(None, 100).await.unwrap().items.len(), 4);
+    assert!(client.definition("cleanup").await.unwrap().is_some());
+    assert_eq!(client.workers(None, 10).await.unwrap().items.len(), 2);
+    assert_eq!(
+        client
+            .inspect("run-003")
+            .await
+            .unwrap()
+            .unwrap()
+            .annotations["gen_ai.usage.input_tokens"],
+        common::INPUT_TOKENS.into()
+    );
     assert!(
         !client
             .journal(None, None, 100)
@@ -526,14 +610,8 @@ async fn definition_catalog_spans_pages_in_both_access_modes(backend: Backend) {
     let fixture = Fixture::new(&backend).await;
     let real = fixture.real.as_ref().unwrap();
     let yaml = "document: { dsl: '1.0.4', namespace: test, name: workflow, version: '1.0.0' }\ndo:\n  - done: { set: { ok: true } }\n";
-    let mut expected: Vec<_> = fixture
-        .definitions()
-        .await
-        .unwrap()
-        .into_iter()
-        .map(|d| d.name)
-        .collect();
-    // Cross the 256-row boundary; adjacent prefix keys must remain distinct.
+    let mut expected = catalog(fixture.client.as_ref()).await;
+    // Several pages; adjacent prefix keys must remain distinct.
     let names = (0..260)
         .map(|i| format!("catalog-{i:03}"))
         .chain(["catalog-255-child".into(), "catalog-255-é".into()]);
@@ -546,14 +624,20 @@ async fn definition_catalog_spans_pages_in_both_access_modes(backend: Backend) {
         let client = OuroControl::connect(fixture.spec.as_deref().unwrap(), read_only)
             .await
             .unwrap();
-        let names: Vec<_> = client
-            .definitions()
-            .await
-            .unwrap()
-            .into_iter()
-            .map(|d| d.name)
-            .collect();
-        assert_eq!(names, expected, "read_only={read_only}");
+        assert_eq!(catalog(&client).await, expected, "read_only={read_only}");
+    }
+}
+/// Every definition name, following ouro's continuation across bounded pages.
+async fn catalog(client: &dyn ControlClient) -> Vec<String> {
+    let mut names = Vec::new();
+    let mut cursor = None;
+    loop {
+        let page = client.definitions(cursor.as_ref(), 100).await.unwrap();
+        names.extend(page.items.into_iter().map(|d| d.name));
+        cursor = page.next;
+        if cursor.is_none() {
+            return names;
+        }
     }
 }
 

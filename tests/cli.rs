@@ -31,7 +31,10 @@ fn every_script_command_parses_and_mutations_require_reason() {
         vec!["run-log", "run-002"],
         vec!["pending", "--event-type", "review.decision"],
         vec!["definitions"],
+        vec!["definitions", "--limit", "10", "--cursor", "opaque"],
+        vec!["definition", "review"],
         vec!["workers"],
+        vec!["workers", "--limit", "5"],
         vec!["journal", "--run", "run-002"],
         vec!["counts", "--definition", "review"],
         vec!["status"],
@@ -105,6 +108,46 @@ async fn script_dispatch_uses_shared_client_and_read_only_policy(backend: Backen
     .await
     .unwrap();
     assert_eq!(runs["items"].as_array().unwrap().len(), 1);
+    let workers = cli::execute(&session, parse(vec!["workers"]))
+        .await
+        .unwrap();
+    let workers = workers["items"].as_array().unwrap();
+    let worker = |id: &str| workers.iter().find(|w| w["id"] == id).unwrap().clone();
+    assert_eq!(worker(&fixture.live_worker)["stale"], false);
+    assert_eq!(worker(&fixture.live_worker)["application"], "1.4.0");
+    assert_eq!(worker(&fixture.stale_worker)["stale"], true);
+    let definition = cli::execute(&session, parse(vec!["definition", "cleanup"]))
+        .await
+        .unwrap();
+    assert_eq!(definition["tripped"]["kind"], "manual");
+    assert_eq!(definition["schedules"][0]["kind"], "every");
+    assert!(matches!(
+        cli::execute(&session, parse(vec!["definition", "missing"])).await,
+        Err(ControlError::NotFound(_))
+    ));
+    let page = cli::execute(&session, parse(vec!["definitions", "--limit", "2"]))
+        .await
+        .unwrap();
+    assert_eq!(page["items"].as_array().unwrap().len(), 2);
+    let next = page["next"].as_str().unwrap();
+    let rest = cli::execute(&session, parse(vec!["definitions", "--cursor", next]))
+        .await
+        .unwrap();
+    assert_eq!(rest["items"][0]["name"], "review");
+    let inspection = cli::execute(&session, parse(vec!["inspect", "run-002"]))
+        .await
+        .unwrap();
+    assert_eq!(inspection["trace_id"], common::TRACE_ID);
+    assert!(inspection["annotations"]["gen_ai.usage.input_tokens"].is_number());
+    let log = cli::execute(&session, parse(vec!["run-log", "run-002"]))
+        .await
+        .unwrap();
+    assert!(
+        log.as_array()
+            .unwrap()
+            .iter()
+            .any(|c| c["annotations"]["gen_ai.usage.output_tokens"].is_number())
+    );
     session.read_only = true;
     assert!(matches!(
         cli::execute(&session, parse(vec!["resume-all", "--reason", "test"])).await,

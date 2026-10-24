@@ -2,7 +2,14 @@
 use ouro_console::{client::*, fake::FakeControl, ouro::OuroControl};
 use ouro_durable::{AtomicBackend, Clock, RunStore, TransactionalStore};
 use ouro_runtime::{
-    Config, Function, FunctionContext, Registry, Runtime, control::Control, ows::run::Status,
+    Config, Function, FunctionContext, Output, Registry, Runtime,
+    control::Control,
+    durable::Compatibility,
+    opentelemetry::{
+        Context,
+        trace::{FutureExt, SpanContext, SpanId, TraceContextExt, TraceFlags, TraceId, TraceState},
+    },
+    ows::run::Status,
 };
 use serde_json::{Value, json};
 use std::{
@@ -48,8 +55,24 @@ impl Backend {
         }
     }
 }
+/// The span context run-002 and run-003 are admitted in (the fake reports the same).
+pub const TRACE_ID: &str = "0123456789abcdef0123456789abcdef";
+pub const SPAN_ID: &str = "0123456789abcdef";
+/// What every `echo` call answers beside its result, under the GenAI names.
+pub const INPUT_TOKENS: i64 = 12;
+pub const OUTPUT_TOKENS: i64 = 5;
+/// A clock behind real time, so a runtime's heartbeat is already stale.
+struct Behind(i64);
+impl Clock for Behind {
+    fn now_ms(&self) -> i64 {
+        ouro_durable::SystemClock.now_ms() - self.0
+    }
+}
 pub struct Fixture {
     pub client: Arc<dyn ControlClient>,
+    /// Heartbeat rows: one that just beat and one that stopped beating.
+    pub live_worker: String,
+    pub stale_worker: String,
     pub real: Option<Real>,
     pub wait_key: String,
     pub spec: Option<String>,
@@ -73,6 +96,8 @@ impl Fixture {
             Backend::Fake => {
                 return Self {
                     client: Arc::new(FakeControl::new()),
+                    live_worker: "worker-a".into(),
+                    stale_worker: "worker-b".into(),
                     real: None,
                     wait_key: "/decision".into(),
                     spec: None,
@@ -129,23 +154,55 @@ impl Fixture {
                 "echo",
                 json!({}),
                 json!({}),
-                |v: Value, _: FunctionContext| async { Ok(v) },
+                |v: Value, _: FunctionContext| async {
+                    Ok(Output::new(v)
+                        .annotate("gen_ai.request.model", "model-a")
+                        .annotate("gen_ai.usage.input_tokens", INPUT_TOKENS)
+                        .annotate("gen_ai.usage.output_tokens", OUTPUT_TOKENS))
+                },
             ))
             .unwrap();
-        let tracer = ouro_runtime::opentelemetry::global::BoxedTracer::new(Box::new(
-            ouro_runtime::opentelemetry::trace::noop::NoopTracer::new(),
-        ));
+        let registry = Arc::new(registry);
+        let tracer = || {
+            ouro_runtime::opentelemetry::global::BoxedTracer::new(Box::new(
+                ouro_runtime::opentelemetry::trace::noop::NoopTracer::new(),
+            ))
+        };
+        let config = |host: &str, version: &str| Config {
+            breaker_threshold: 1,
+            host_name: Some(host.into()),
+            application: Compatibility {
+                version: Some(version.into()),
+                accepts: vec![],
+            },
+            ..Config::default()
+        };
         let runtime = Runtime::new(
             store.clone(),
-            Arc::new(registry),
-            Config {
-                breaker_threshold: 1,
-                ..Config::default()
-            },
+            registry.clone(),
+            config("host-a", "1.4.0"),
             clock.clone(),
-            tracer,
+            tracer(),
         )
         .unwrap();
+        runtime.heartbeat().await.unwrap();
+        // A second worker beat ten minutes ago and never again.
+        let gone = Runtime::new(
+            store.clone(),
+            registry,
+            config("host-b", "1.3.2"),
+            Arc::new(Behind(600_000)),
+            tracer(),
+        )
+        .unwrap();
+        gone.heartbeat().await.unwrap();
+        let admitted = Context::new().with_remote_span_context(SpanContext::new(
+            TraceId::from_hex(TRACE_ID).unwrap(),
+            SpanId::from_hex(SPAN_ID).unwrap(),
+            TraceFlags::SAMPLED,
+            true,
+            TraceState::default(),
+        ));
         let workflow = |body: &str| {
             format!(
                 "document: {{ dsl: '1.0.4', namespace: test, name: workflow, version: '1.0.0' }}\ndo:\n{body}\n"
@@ -188,7 +245,15 @@ impl Fixture {
             ("run-006", "review"),
             ("run-010", "transform"),
         ] {
-            runtime.start(id, name, json!({})).await.unwrap();
+            if matches!(id, "run-002" | "run-003") {
+                runtime
+                    .start(id, name, json!({}))
+                    .with_context(admitted.clone())
+                    .await
+                    .unwrap();
+            } else {
+                runtime.start(id, name, json!({})).await.unwrap();
+            }
         }
         for id in ["run-002", "run-003", "run-004", "run-005", "run-010"] {
             runtime.drive(id, &stop).await.unwrap();
@@ -269,7 +334,9 @@ impl Fixture {
             .remove(0)
             .key;
         Self {
-            client: Arc::new(OuroControl::new(backend.clone(), clock, false)),
+            client: Arc::new(OuroControl::new(store.clone(), clock, false)),
+            live_worker: runtime.worker_id().into(),
+            stale_worker: gone.worker_id().into(),
             real: Some(Real {
                 runtime,
                 control,
