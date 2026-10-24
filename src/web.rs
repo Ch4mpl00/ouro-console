@@ -254,9 +254,9 @@ async fn layout(app: &App, title: &str, subtitle: &str, content: Markup) -> Resu
                 div class="page-header mb-4" { div class="row align-items-center" { div class="col" {
                     div class="page-pretitle" { "OPERATIONS / " (if app.session.read_only { "READ ONLY" } else { "OPERATOR" }) }
                     h1 class="page-title" { (title) } p class="text-secondary mt-2 mb-0" { (subtitle) }
-                } div class="col-auto" { span class="badge bg-azure-lt" { "Fake backend" } } } }
+                } div class="col-auto" { span class="badge bg-azure-lt" { (app.session.client.backend_label()) } } } }
                 (content)
-            } footer class="container-xl py-3 text-secondary small" { "Actor: " (app.session.actor) " · Demo data resets on restart · ouro-console v0.1" } }
+            } footer class="container-xl py-3 text-secondary small" { "Actor: " (app.session.actor) " · ouro-console v0.1" } }
         } }
     } })
 }
@@ -529,12 +529,14 @@ async fn definitions(State(app): State<App>) -> Result<Markup> {
 async fn workers(State(app): State<App>) -> Result<Markup> {
     let workers = app.session.client.workers().await?;
     layout(&app,"Workers","Heartbeat snapshots from the host. A heartbeat older than 30 seconds is stale.",html! {
+        @match workers { Workers::Unavailable { reason } => { div class="alert alert-info" { (reason) } }, Workers::Available(workers) => {
         section class="card" { div class="table-responsive" { table class="table card-table table-vcenter" {
             thead { tr { th { "Worker" } th { "Heartbeat" } th { "RSS" } th { "CPU" } th { "Runs held" } } }
             tbody { @for w in workers { tr { td { strong { (w.id) } } td title=(time(w.heartbeat_ms)) { (age(w.heartbeat_ms)) " " @if now_ms()-w.heartbeat_ms>30_000 { span class="badge bg-red-lt" { "stale" } } @else { span class="badge bg-green-lt" { "healthy" } } }
                 td { (w.rss_bytes/1_048_576) " MiB" } td { (format!("{:.1}%",w.cpu_percent)) } td { @for id in w.runs_held { a class="me-2" href=(format!("/runs/{id}")) { (id) } } }
             } } }
         } } }
+        } }
     }).await
 }
 #[derive(Deserialize, Serialize)]

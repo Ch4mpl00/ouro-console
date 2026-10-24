@@ -1,6 +1,7 @@
 use crate::{
     client::*,
     fake::FakeControl,
+    ouro::OuroControl,
     web::{self, WebConfig},
 };
 use clap::{Args, Parser, Subcommand};
@@ -9,17 +10,22 @@ use serde_json::Value;
 use std::{net::SocketAddr, path::PathBuf, sync::Arc};
 
 #[derive(Debug, Parser)]
-#[command(
-    version,
-    about = "Operations console for ouro (in-memory fake backend in v1)"
-)]
+#[command(version, about = "Operations console for ouro")]
 pub struct Cli {
     #[arg(
         long,
         global = true,
-        help = "Use realistic process-local demo data (currently the only backend)"
+        conflicts_with = "store",
+        help = "Use realistic process-local demo data"
     )]
     pub fake: bool,
+    #[arg(
+        long,
+        global = true,
+        env = "OURO_STORE",
+        help = "sqlite:<path> or postgres:<url>"
+    )]
+    pub store: Option<String>,
     #[arg(long, global = true, env = "OURO_CONSOLE_ACTOR")]
     pub actor: Option<String>,
     #[arg(long, global = true, env = "OURO_CONSOLE_TOKEN_FILE")]
@@ -203,12 +209,13 @@ pub async fn run(cli: Cli) -> Result<()> {
     if actor.trim().is_empty() {
         return Err(ControlError::Invalid("actor must be nonempty".into()));
     }
+    let client = connect(cli.fake, cli.store.as_deref(), cli.read_only).await?;
+    eprintln!("Backend: {}", client.backend_label());
     let session = Session {
-        client: Arc::new(FakeControl::new()),
+        client,
         actor,
         read_only: cli.read_only,
     };
-    eprintln!("Fake backend: data is process-local and resets on exit.");
     if let Action::Serve { bind } = cli.command {
         let config = WebConfig::new(bind, auth.map(|c| c.token), cli.trace_url)?;
         let listener = tokio::net::TcpListener::bind(bind)
@@ -234,6 +241,20 @@ pub async fn run(cli: Cli) -> Result<()> {
         );
     }
     Ok(())
+}
+/// Compose the same backend for scripts, web and MCP. No implicit demo fallback.
+pub async fn connect(
+    fake: bool,
+    store: Option<&str>,
+    read_only: bool,
+) -> Result<Arc<dyn ControlClient>> {
+    match (fake, store) {
+        (true, None) => Ok(Arc::new(FakeControl::new())),
+        (false, Some(spec)) => Ok(Arc::new(OuroControl::connect(spec, read_only).await?)),
+        _ => Err(ControlError::Invalid(
+            "choose --fake or --store sqlite:<path>|postgres:<url> (OURO_STORE)".into(),
+        )),
+    }
 }
 fn json<T: serde::Serialize>(value: T) -> Result<Value> {
     serde_json::to_value(value).map_err(|e| ControlError::Internal(e.to_string()))

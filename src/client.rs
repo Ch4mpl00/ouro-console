@@ -1,4 +1,4 @@
-//! Console-owned async boundary. The real ouro adapter will translate these DTOs.
+//! Console-owned async boundary, translated by each backend.
 use async_trait::async_trait;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
@@ -180,7 +180,7 @@ pub struct PendingWait {
     pub filters: Value,
     pub expectations: Value,
     pub progress: Value,
-    pub position: u64,
+    pub position: String,
     pub since_ms: i64,
     pub timeout_ms: Option<i64>,
     pub redacted: bool,
@@ -238,9 +238,16 @@ pub struct Worker {
     pub cpu_percent: f64,
     pub runs_held: Vec<String>,
 }
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(tag = "status", content = "data", rename_all = "snake_case")]
+pub enum Workers {
+    Available(Vec<Worker>),
+    Unavailable { reason: String },
+}
 
 #[async_trait]
 pub trait ControlClient: Send + Sync {
+    fn backend_label(&self) -> &'static str;
     async fn execute(&self, request: &Request, command: &Command) -> Result<Reply>;
     async fn stopped(&self) -> Result<bool>;
     async fn inspect(&self, run: &str) -> Result<Option<Inspection>>;
@@ -277,7 +284,7 @@ pub trait ControlClient: Send + Sync {
         limit: usize,
     ) -> Result<Page<Entry>>;
     async fn definitions(&self) -> Result<Vec<Definition>>;
-    async fn workers(&self) -> Result<Vec<Worker>>;
+    async fn workers(&self) -> Result<Workers>;
     async fn cancel(&self, request: &Request, run: &str) -> Result<Reply> {
         self.execute(request, &Command::Cancel { run: run.into() })
             .await

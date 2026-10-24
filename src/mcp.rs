@@ -272,6 +272,6 @@ impl ServerHandler for Mcp {
     fn get_info(&self) -> ServerConfig {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("ouro-console", env!("CARGO_PKG_VERSION")))
-            .with_instructions("ouro operations console. Fake data is process-local and resets on restart. Mutations require reason; use request_id for safe retry.")
+            .with_instructions("ouro operations console. Mutations require reason; use request_id for safe retry. Worker availability is reported explicitly by the backend.")
     }
 }

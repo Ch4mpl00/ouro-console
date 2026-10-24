@@ -32,7 +32,10 @@ async fn owned_tree_cancellation_keeps_terminal_evidence_and_independent_runs() 
             .calls
             .is_empty()
     );
-    assert!(c.workers().await.unwrap()[0].runs_held.is_empty());
+    let Workers::Available(workers) = c.workers().await.unwrap() else {
+        panic!("fake workers unavailable")
+    };
+    assert!(workers[0].runs_held.is_empty());
 }
 #[tokio::test]
 async fn commands_replay_original_reply_and_reject_conflicting_ids() {
