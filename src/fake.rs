@@ -73,8 +73,26 @@ impl FakeControl {
                             state: s.into(),
                             arguments: json!({"item":"sample"}),
                             result: (s == "completed").then(|| json!({"ok":true})),
+                            annotations: if s == "completed" {
+                                BTreeMap::from([
+                                    ("gen_ai.request.model".into(), json!("model-a")),
+                                    ("gen_ai.usage.input_tokens".into(), json!(1200)),
+                                    ("gen_ai.usage.output_tokens".into(), json!(340)),
+                                    ("cost_usd".into(), json!(0.012)),
+                                ])
+                            } else {
+                                BTreeMap::new()
+                            },
                         })
                         .collect(),
+                    annotations: BTreeMap::from([
+                        ("gen_ai.usage.input_tokens".into(), 1200.into()),
+                        ("gen_ai.usage.output_tokens".into(), 340.into()),
+                        (
+                            "cost_usd".into(),
+                            serde_json::Number::from_f64(0.012).expect("finite"),
+                        ),
+                    ]),
                     children: vec![],
                     budget_spent: 7,
                     budget_limit: Some(100),
@@ -112,6 +130,7 @@ impl FakeControl {
             child.run.version = "v1".into();
             child.lease = None;
             child.calls.clear();
+            child.annotations.clear();
             if state == RunState::Waiting {
                 child.waits.insert(
                     "/signal".into(),
@@ -130,29 +149,44 @@ impl FakeControl {
             }
             runs.insert(id.into(), child);
         }
+        let versions = |n: u64| {
+            (1..=n)
+                .map(|v| Version {
+                    version: format!("v{v}"),
+                    activated_ms: Some(now - 86_400_000 / i64::try_from(v).unwrap_or(1)),
+                })
+                .collect::<Vec<_>>()
+        };
+        let schedule = |kind: &str, next_due_ms: Option<i64>| Schedule {
+            kind: kind.into(),
+            next_due_ms,
+            overlap: "skip".into(),
+            catchup: "latest".into(),
+            queued: None,
+        };
         let definitions = vec![
             Definition {
                 name: "review".into(),
-                versions: vec!["v1".into(), "v2".into()],
-                active: "v2".into(),
+                versions: versions(2),
+                active: Some("v2".into()),
                 epoch: 2,
                 faults: 0,
                 tripped: None,
-                schedule: Some("every 5 minutes".into()),
+                schedules: vec![schedule("every", Some(now + 300_000))],
             },
             Definition {
                 name: "transform".into(),
-                versions: vec!["v1".into()],
-                active: "v1".into(),
+                versions: versions(1),
+                active: Some("v1".into()),
                 epoch: 1,
                 faults: 0,
                 tripped: None,
-                schedule: None,
+                schedules: vec![],
             },
             Definition {
                 name: "archive".into(),
-                versions: vec!["v1".into(), "v2".into()],
-                active: "v2".into(),
+                versions: versions(2),
+                active: Some("v2".into()),
                 epoch: 3,
                 faults: 3,
                 tripped: Some(Trip::Automatic {
@@ -160,37 +194,52 @@ impl FakeControl {
                     threshold: 3,
                     run: "run-005".into(),
                     error: "upstream deadline exceeded".into(),
+                    at_ms: now - 400_000,
                 }),
-                schedule: Some("daily at 02:00 UTC".into()),
+                // An automatic trip disarms the schedule: no next due time.
+                schedules: vec![schedule("cron", None)],
             },
             Definition {
                 name: "cleanup".into(),
-                versions: vec!["v1".into()],
-                active: "v1".into(),
+                versions: versions(1),
+                active: Some("v1".into()),
                 epoch: 1,
                 faults: 1,
                 tripped: Some(Trip::Manual {
                     actor: "demo-operator".into(),
                     reason: "maintenance window".into(),
                     note: "resume after review".into(),
+                    at_ms: now - 300_000,
                 }),
-                schedule: Some("hourly".into()),
+                schedules: vec![Schedule {
+                    queued: Some(QueuedSlot {
+                        run: "cleanup-slot-1".into(),
+                        version: "v1".into(),
+                    }),
+                    ..schedule("every", Some(now + 3_600_000))
+                }],
             },
         ];
         let workers = vec![
             Worker {
                 id: "worker-a".into(),
-                heartbeat_ms: now - 2_000,
-                rss_bytes: 134_217_728,
-                cpu_percent: 14.2,
-                runs_held: vec!["run-002".into()],
+                host: Some("host-a".into()),
+                application: Some("1.4.0".into()),
+                started_ms: now - 7_200_000,
+                beat_ms: now - 2_000,
+                expires_ms: now + 28_000,
+                held: 1,
+                stale: false,
             },
             Worker {
                 id: "worker-b".into(),
-                heartbeat_ms: now - 180_000,
-                rss_bytes: 67_108_864,
-                cpu_percent: 0.0,
-                runs_held: vec![],
+                host: Some("host-b".into()),
+                application: Some("1.3.2".into()),
+                started_ms: now - 86_000_000,
+                beat_ms: now - 180_000,
+                expires_ms: now - 150_000,
+                held: 0,
+                stale: true,
             },
         ];
         let request = Request {
@@ -403,6 +452,7 @@ impl ControlClient for FakeControl {
                         actor: request.actor.clone(),
                         reason: request.reason.clone(),
                         note: note.clone(),
+                        at_ms: now_ms(),
                     });
                 }
                 Reply::Changed(changed)
@@ -601,26 +651,43 @@ impl ControlClient for FakeControl {
             .collect();
         paginate(&json!(["journal", run]), rows, cursor, limit)
     }
-    async fn definitions(&self) -> Result<Vec<Definition>> {
-        Ok(self.data()?.definitions.clone())
+    async fn definitions(&self, cursor: Option<&Cursor>, limit: usize) -> Result<Page<Definition>> {
+        let rows = self
+            .data()?
+            .definitions
+            .iter()
+            .map(|d| (d.name.clone(), d.clone()))
+            .collect();
+        paginate(&json!(["definitions"]), rows, cursor, limit)
     }
-    async fn workers(&self) -> Result<Workers> {
+    async fn definition(&self, name: &str) -> Result<Option<Definition>> {
+        Ok(self
+            .data()?
+            .definitions
+            .iter()
+            .find(|d| d.name == name)
+            .cloned())
+    }
+    async fn workers(&self, cursor: Option<&Cursor>, limit: usize) -> Result<Page<Worker>> {
         let data = self.data()?;
-        Ok(Workers::Available(
-            data.workers
-                .iter()
-                .cloned()
-                .map(|mut w| {
-                    w.runs_held = data
-                        .runs
-                        .values()
-                        .filter(|i| i.lease.as_ref().is_some_and(|l| l.holder == w.id))
-                        .map(|i| i.run.id.clone())
-                        .collect();
-                    w
-                })
-                .collect(),
-        ))
+        let now = now_ms();
+        let rows = data
+            .workers
+            .iter()
+            .cloned()
+            .map(|mut w| {
+                // Held runs and staleness follow the demo's leases and clock.
+                let held = data
+                    .runs
+                    .values()
+                    .filter(|i| i.lease.as_ref().is_some_and(|l| l.holder == w.id))
+                    .count();
+                w.held = u64::try_from(held).unwrap_or(u64::MAX);
+                w.stale = w.expires_ms <= now;
+                (w.id.clone(), w)
+            })
+            .collect();
+        paginate(&json!(["workers"]), rows, cursor, limit)
     }
 }
 

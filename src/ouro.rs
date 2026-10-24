@@ -2,7 +2,7 @@
 use crate::client::*;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use ouro_durable::{AtomicBackend, Clock, RunStore, TransactionalStore};
+use ouro_durable::{Clock, RunStore, TransactionalStore};
 use ouro_runtime::{control as api, ows};
 use serde::Serialize;
 use serde_json::Value;
@@ -10,61 +10,52 @@ use std::sync::Arc;
 
 pub struct OuroControl {
     control: api::Control,
-    store: Arc<dyn RunStore>,
-    catalog: Arc<dyn AtomicBackend>,
     read_only: bool,
 }
 impl OuroControl {
-    /// One backend supplies both the control service and the definition catalog.
-    pub fn new(backend: Arc<dyn AtomicBackend>, clock: Arc<dyn Clock>, read_only: bool) -> Self {
-        let store: Arc<dyn RunStore> = Arc::new(TransactionalStore::new(backend.clone()));
+    /// Every observation and command goes through ouro's control API; the
+    /// console never reads the store's rows or key layout.
+    pub fn new(store: Arc<dyn RunStore>, clock: Arc<dyn Clock>, read_only: bool) -> Self {
         Self {
-            control: api::Control::new(store.clone(), clock),
-            store,
-            catalog: backend,
+            control: api::Control::new(store, clock),
             read_only,
         }
     }
     /// Writable adapters migrate on open. Read-only adapters require an existing schema.
     pub async fn connect(spec: &str, read_only: bool) -> Result<Self> {
-        if spec
-            .strip_prefix("sqlite:")
-            .or_else(|| spec.strip_prefix("postgres:"))
-            .is_none_or(|s| s.is_empty())
-        {
-            return Err(ControlError::Invalid(
-                "store must be sqlite:<path> or postgres:<url>".into(),
-            ));
-        }
-        let backend: Arc<dyn AtomicBackend> = if read_only {
-            Arc::new(
-                crate::readonly::ReadBackend::open(spec)
-                    .await
-                    .map_err(storage_error)?,
-            )
-        } else if let Some(path) = spec.strip_prefix("sqlite:").filter(|p| !p.is_empty()) {
+        let invalid =
+            || ControlError::Invalid("store must be sqlite:<path> or postgres:<url>".into());
+        let sqlite = spec.strip_prefix("sqlite:").filter(|p| !p.is_empty());
+        let postgres = spec.strip_prefix("postgres:").filter(|p| !p.is_empty());
+        let store: Arc<dyn RunStore> = if read_only {
+            if sqlite.is_none() && postgres.is_none() {
+                return Err(invalid());
+            }
+            // ouro's own constructors create and migrate the schema, so the
+            // read-only mode supplies its own non-migrating transport.
+            let backend = crate::readonly::ReadBackend::open(spec)
+                .await
+                .map_err(storage_error)?;
+            Arc::new(TransactionalStore::new(Arc::new(backend)))
+        } else if let Some(path) = sqlite {
             let path = path.to_owned();
             Arc::new(
-                tokio::task::spawn_blocking(move || {
-                    ouro_durable::sqlite::SqliteBackend::open(path)
-                })
-                .await
-                .map_err(|e| ControlError::Internal(e.to_string()))?
-                .map_err(storage_error)?,
+                tokio::task::spawn_blocking(move || ouro_durable::sqlite::open(path))
+                    .await
+                    .map_err(|e| ControlError::Internal(e.to_string()))?
+                    .map_err(storage_error)?,
             )
-        } else if let Some(url) = spec.strip_prefix("postgres:").filter(|p| !p.is_empty()) {
+        } else if let Some(url) = postgres {
             Arc::new(
-                ouro_durable::postgres::PostgresBackend::connect(url)
+                ouro_durable::postgres::connect(url)
                     .await
                     .map_err(storage_error)?,
             )
         } else {
-            return Err(ControlError::Invalid(
-                "store must be sqlite:<path> or postgres:<url>".into(),
-            ));
+            return Err(invalid());
         };
         Ok(Self::new(
-            backend,
+            store,
             Arc::new(ouro_durable::SystemClock),
             read_only,
         ))
@@ -283,6 +274,17 @@ fn inspection(inspection: api::Inspection) -> Result<Inspection> {
                 .into(),
                 arguments,
                 result,
+                annotations: call
+                    .annotations
+                    .into_iter()
+                    .map(|(name, a)| {
+                        let value = match a {
+                            ows::durable::Annotation::Number(n) => Value::Number(n),
+                            ows::durable::Annotation::Text(t) => Value::String(t),
+                        };
+                        (name, value)
+                    })
+                    .collect(),
             })
         })
         .collect::<Result<_>>()?;
@@ -300,6 +302,7 @@ fn inspection(inspection: api::Inspection) -> Result<Inspection> {
             .map(value)
             .collect::<Result<_>>()?,
         calls,
+        annotations: inspection.annotations,
         children: inspection
             .children
             .into_iter()
@@ -435,85 +438,110 @@ impl ControlClient for OuroControl {
             |e| Ok(entry(e)),
         )
     }
-    async fn definitions(&self) -> Result<Vec<Definition>> {
-        // RunStore exposes definitions(name), but no name enumeration at this pin.
-        // Scan only catalog keys in bounded chunks; decode versions through RunStore.
-        let mut tx = self.catalog.begin().await.map_err(storage_error)?;
-        let mut names = Vec::new();
-        let mut start = None;
-        loop {
-            let rows = tx
-                .scan("definitions", start.as_deref().unwrap_or(""), None, 256)
+    async fn definitions(&self, c: Option<&Cursor>, limit: usize) -> Result<Page<Definition>> {
+        page(
+            self.control
+                .definitions(cursor(c)?.as_ref(), limit)
                 .await
-                .map_err(storage_error)?;
-            let mut advanced = false;
-            for ((_, name), _) in rows {
-                // scan has an inclusive lower bound. Reuse the actual key and
-                // skip its overlap: Postgres text cannot contain a NUL suffix.
-                if start.as_ref() == Some(&name) {
-                    continue;
-                }
-                start = Some(name.clone());
-                names.push(name);
-                advanced = true;
-            }
-            if !advanced {
-                break;
-            }
-        }
-        tx.rollback().await;
-        let mut result = Vec::new();
-        for name in names {
-            let definitions = self.store.definitions(&name).await.map_err(storage_error)?;
-            let schedule = definitions
-                .active
-                .and_then(|v| definitions.versions.get(&v))
-                .map(|d| {
-                    let workflow = ows::model::parse_yaml(&d.yaml)
-                        .map_err(|e| ControlError::Internal(e.to_string()))?;
-                    Ok(workflow.definition.get("schedule").map(Value::to_string))
-                })
-                .transpose()?
-                .flatten();
-            let tripped = definitions
-                .tripped
-                .map(|t| match t.manual {
-                    Some(m) => Ok(Trip::Manual {
-                        actor: m.actor,
-                        reason: m.reason,
-                        note: m.note,
-                    }),
-                    None => Ok(Trip::Automatic {
-                        faults: t.faults,
-                        threshold: t.threshold,
-                        run: t.run,
-                        error: value(t.reason)?.to_string(),
-                    }),
-                })
-                .transpose()?;
-            result.push(Definition {
-                name,
-                versions: definitions
-                    .versions
-                    .keys()
-                    .map(ToString::to_string)
-                    .collect(),
-                active: definitions
-                    .active
-                    .map_or_else(|| "none".into(), |v| v.to_string()),
-                epoch: definitions.epoch,
-                faults: definitions.consecutive_faults,
-                tripped,
-                schedule,
-            });
-        }
-        Ok(result)
+                .map_err(storage_error)?,
+            definition,
+        )
     }
-    async fn workers(&self) -> Result<Workers> {
-        Ok(Workers::Unavailable {
-            reason: "Worker heartbeats are not available yet (ouro#20).".into(),
+    async fn definition(&self, name: &str) -> Result<Option<Definition>> {
+        self.control
+            .definition(name)
+            .await
+            .map_err(storage_error)?
+            .map(definition)
+            .transpose()
+    }
+    async fn workers(&self, c: Option<&Cursor>, limit: usize) -> Result<Page<Worker>> {
+        page(
+            self.control
+                .workers(cursor(c)?.as_ref(), limit)
+                .await
+                .map_err(storage_error)?,
+            |status| {
+                let w = status.worker;
+                Ok(Worker {
+                    id: w.id,
+                    host: w.host,
+                    application: w.application,
+                    started_ms: w.started_ms,
+                    beat_ms: w.beat_ms,
+                    expires_ms: w.expires_ms,
+                    held: w.held,
+                    stale: status.stale,
+                })
+            },
+        )
+    }
+}
+fn definition(summary: api::DefinitionSummary) -> Result<Definition> {
+    let tripped = summary
+        .tripped
+        .map(|t| match t.manual {
+            Some(m) => Ok(Trip::Manual {
+                actor: m.actor,
+                reason: m.reason,
+                note: m.note,
+                at_ms: t.at_ms,
+            }),
+            None => Ok(Trip::Automatic {
+                faults: t.faults,
+                threshold: t.threshold,
+                run: t.run,
+                error: value(t.reason)?.to_string(),
+                at_ms: t.at_ms,
+            }),
         })
-    }
+        .transpose()?;
+    let schedules = summary
+        .schedules
+        .into_iter()
+        .map(|s| Schedule {
+            kind: match s.kind {
+                api::ScheduleKind::Every => "every",
+                api::ScheduleKind::Cron => "cron",
+                api::ScheduleKind::After => "after",
+                api::ScheduleKind::On => "on",
+            }
+            .into(),
+            next_due_ms: s.next_due_ms,
+            overlap: match s.overlap {
+                ouro_durable::Overlap::Skip => "skip",
+                ouro_durable::Overlap::Allow => "allow",
+                ouro_durable::Overlap::Queue => "queue",
+                ouro_durable::Overlap::Replace => "replace",
+            }
+            .into(),
+            catchup: match s.catchup {
+                api::ScheduleCatchup::Latest => "latest",
+                api::ScheduleCatchup::None => "none",
+            }
+            .into(),
+            queued: s.queued.map(|q| QueuedSlot {
+                run: q.run,
+                version: q.version.to_string(),
+            }),
+        })
+        .collect();
+    Ok(Definition {
+        name: summary.name,
+        versions: summary
+            .versions
+            .into_iter()
+            .map(|v| Version {
+                version: v.version.to_string(),
+                activated_ms: v.activated_ms,
+            })
+            .collect(),
+        active: summary.active.map(|v| v.to_string()),
+        epoch: summary.epoch,
+        faults: summary.consecutive_faults,
+        tripped,
+        schedules,
+    })
 }
 
 #[cfg(test)]

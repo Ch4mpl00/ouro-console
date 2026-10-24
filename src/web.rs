@@ -374,10 +374,11 @@ async fn runs(
     if headers.get("hx-request").is_some_and(|h| h == "true") {
         return Ok(panel);
     }
-    let defs = app.session.client.definitions().await?;
+    // One bounded page feeds the selector; a larger catalog gets a text field.
+    let defs = app.session.client.definitions(None, 200).await?;
     layout(&app,"Runs","Inspect execution, follow owned trees, and stop work when it needs attention.",html! {
         form method="get" action="/runs" class="card card-body mb-4" { div class="row g-3 align-items-end" {
-            div class="col-md" { label class="form-label" for="definition" { "Definition" } select id="definition" class="form-select" name="definition" { option value="" { "All definitions" } @for d in defs { option value=(d.name) selected[query.definition.as_ref() == Some(&d.name)] { (d.name) } } } }
+            div class="col-md" { label class="form-label" for="definition" { "Definition" } @if defs.next.is_some() { input id="definition" class="form-control" name="definition" placeholder="All definitions" value=(query.definition.as_deref().unwrap_or_default()); } @else { select id="definition" class="form-select" name="definition" { option value="" { "All definitions" } @for d in &defs.items { option value=(d.name) selected[query.definition.as_ref() == Some(&d.name)] { (d.name) } } } } }
             div class="col-md" { label class="form-label" for="state" { "State" } select id="state" class="form-select" name="state" { option value="" { "All states" } @for s in RunState::ALL { option value=(s.label()) selected[query.state == Some(s)] { (s.label()) } } } }
             div class="col-md" { label class="form-label" for="age" { "Age" } select id="age" class="form-select" name="age_minutes" { @for (n,label) in [(60,"Last hour"),(1440,"Last day"),(10080,"Last week")] { option value=(n) selected[query.age_minutes.unwrap_or(1440) == n] { (label) } } } }
             div class="col-md" { label class="form-label" for="history" { "Time index" } select id="history" class="form-select" name="history" { option value="false" selected[!query.history] { "Admitted runs" } option value="true" selected[query.history] { "Ended runs" } } }
@@ -437,13 +438,26 @@ async fn detail(State(app): State<App>, Path(id): Path<String>) -> Result<Markup
                     dt class="col-sm-3" { "Admitted" } dd class="col-sm-9" { (time(i.run.admitted_ms)) }
                     dt class="col-sm-3" { "Lease holder / expiry" } dd class="col-sm-9" { @if let Some(lease) = &i.lease { (lease.holder) " · " (time(lease.expires_ms)) } @else { "No active lease" } }
                     dt class="col-sm-3" { "Jump budget" } dd class="col-sm-9" { (i.budget_spent) " spent / " (i.budget_limit.map(|n|n.to_string()).unwrap_or_else(||"unbounded".into())) }
-                    dt class="col-sm-3" { "Trace" } dd class="col-sm-9" { @if let Some(link) = trace { a href=(link) target="_blank" rel="noopener noreferrer" { "Open trace " (icon("external-link")) } } @else { span class="text-secondary" { "Set --trace-url to link your trace backend" } } }
+                    dt class="col-sm-3" { "Trace" } dd class="col-sm-9" { @match &i.trace_id {
+                        None => { span class="text-secondary" { "No span context was pinned at admission" } },
+                        Some(trace_id) => {
+                            code { (trace_id) } @if let Some(span) = &i.span_id { span class="text-secondary small" { " · span " code { (span) } } }
+                            div { @if let Some(link) = trace { a href=(link) target="_blank" rel="noopener noreferrer" { "Open trace " (icon("external-link")) } } @else { span class="text-secondary small" { "Set --trace-url to link your trace backend" } } }
+                        },
+                    } }
                     @if let Some(error) = &i.run.error { dt class="col-sm-3 text-danger" { "Terminal error" } dd class="col-sm-9" { pre { (error) } } }
                 } }
             }
+            section id="usage" class="card mb-4" { div class="card-header" { h2 class="card-title" { "Usage" } span class="ms-auto text-secondary small" { "Call annotations summed per name" } }
+                div class="card-body" { @let totals = shown(i.annotations.iter().map(|(k, v)| (k, v.to_string())));
+                    @if totals.is_empty() { p class="text-secondary mb-0" { "No numeric annotations recorded" } } @else { (annotations(&totals, true)) }
+                }
+            }
             section class="card mb-4" { div class="card-header" { h2 class="card-title" { "Call journal" } } div class="table-responsive" { table class="table card-table" {
-                thead { tr { th { "Function / key" } th { "Delivery" } th { "State" } th { "Evidence" } } }
-                tbody { @for call in &i.calls { tr { td { (call.function) div class="text-secondary small" { (call.key) } } td { (call.delivery) } td { code { (call.state) } } td { details { summary { "Arguments / result" } pre { (call.arguments) } pre { (json!(call.result)) } } } } } }
+                thead { tr { th { "Function / key" } th { "Delivery" } th { "State" } th { "Annotations" } th { "Evidence" } } }
+                tbody { @for call in &i.calls { tr { td { (call.function) div class="text-secondary small" { (call.key) } } td { (call.delivery) } td { code { (call.state) } }
+                    td { @let a = shown(call.annotations.iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned)))); @if a.is_empty() { span class="text-secondary" { "—" } } @else { (annotations(&a, false)) } }
+                    td { details { summary { "Arguments / result" } pre { (call.arguments) } pre { (json!(call.result)) } } } } } }
             } } }
             section class="card mb-4" { div class="card-header" { h2 class="card-title" { "Pending waits" } } div class="card-body" { @for (key,w) in &i.waits { h3 { (key) } (wait_info(w)) } @if i.waits.is_empty() { p class="text-secondary mb-0" { "No pending waits" } } a href="/pending" { "Open decision queue" } } }
             section class="card" { div class="card-header" { h2 class="card-title" { "Mailbox copies" } } div class="card-body" { pre { (json!(i.mailbox)) } } }
@@ -456,6 +470,35 @@ async fn detail(State(app): State<App>, Path(id): Path<String>) -> Result<Markup
             a href=(format!("/journal?run={id}")) { "Operator journal for this run " (icon("arrow-right")) }
         } }
     }).await
+}
+/// The GenAI semantic-convention names ouro's README recommends for model
+/// steps. Shown first; any other annotation is a plain key/value.
+const INPUT_TOKENS: &str = "gen_ai.usage.input_tokens";
+const OUTPUT_TOKENS: &str = "gen_ai.usage.output_tokens";
+fn shown<'a>(items: impl Iterator<Item = (&'a String, String)>) -> Vec<(&'a str, String)> {
+    items.map(|(k, v)| (k.as_str(), v)).collect()
+}
+fn annotations(items: &[(&str, String)], large: bool) -> Markup {
+    let find = |name: &str| items.iter().find(|(k, _)| *k == name).map(|(_, v)| v);
+    let tokens = [
+        ("Input tokens", INPUT_TOKENS),
+        ("Output tokens", OUTPUT_TOKENS),
+    ]
+    .into_iter()
+    .filter_map(|(label, name)| find(name).map(|v| (label, name, v)))
+    .collect::<Vec<_>>();
+    let rest = items
+        .iter()
+        .filter(|(k, _)| *k != INPUT_TOKENS && *k != OUTPUT_TOKENS);
+    html! {
+        @if !tokens.is_empty() { div class=(if large { "token-usage d-flex gap-4 mb-2" } else { "token-usage" }) {
+            @for (label, name, value) in &tokens { div class="token-count" title=(name) {
+                @if large { div class="h2 mb-0" { (value) } div class="text-secondary small" { (label) " · " code { (name) } } }
+                @else { span class="badge bg-azure-lt me-1" { (label) ": " (value) } }
+            } }
+        } }
+        dl class="annotation-list row mb-0 small" { @for (k, v) in rest { dt class="col-sm-5 fw-normal" { code { (k) } } dd class="col-sm-7 mb-1" { (v) } } }
+    }
 }
 fn wait_info(w: &PendingWait) -> Markup {
     html! {
@@ -504,17 +547,39 @@ async fn pending(State(app): State<App>, Query(q): Query<PendingQuery>) -> Resul
         @if let Some(next) = page.next { @let mut next_q = q; @let _ = next_q.cursor.replace(next); a class="btn mt-3" href=(format!("/pending?{}",serde_urlencoded::to_string(next_q).expect("query"))) { "Next page" } }
     }).await
 }
-async fn definitions(State(app): State<App>) -> Result<Markup> {
-    let definitions = app.session.client.definitions().await?;
+#[derive(Deserialize, Serialize)]
+struct PageQuery {
+    cursor: Option<Cursor>,
+    limit: Option<usize>,
+}
+fn next_link(path: &str, q: PageQuery, next: Option<Cursor>) -> Markup {
+    html! { @if let Some(next) = next { @let mut q = q; @let _ = q.cursor.replace(next); a class="btn mt-3" href=(format!("{path}?{}",serde_urlencoded::to_string(q).expect("query"))) { "Next page" } } }
+}
+fn schedule_info(s: &Schedule, paused: bool) -> Markup {
+    html! { div {
+        strong { (s.kind) } " · "
+        @match s.next_due_ms { Some(due) => { "next " span title=(time(due)) { (time(due)) } }, None => { span class="text-secondary" { "no next due time" } } }
+        @if paused { " · " span class="badge bg-yellow-lt" { "suspended" } }
+        div class="text-secondary small" { "Overlap " (s.overlap) " · catch-up " (s.catchup)
+            @if let Some(q) = &s.queued { " · queued slot " a href=(format!("/runs/{}",q.run)) { (q.run) } " (version " (q.version) ")" } }
+    } }
+}
+async fn definitions(State(app): State<App>, Query(q): Query<PageQuery>) -> Result<Markup> {
+    let page = app
+        .session
+        .client
+        .definitions(q.cursor.as_ref(), q.limit.unwrap_or(50))
+        .await?;
     layout(&app,"Definitions","Versions, admission breakers, and schedules. Existing work finishes during a manual pause.",html! {
-        div class="row g-4" { @for d in definitions { div class="col-lg-6" { section class="card h-100" { div class="card-header" { h2 class="card-title" { (d.name) } span class="badge bg-secondary-lt ms-auto" { "epoch " (d.epoch) } }
+        div class="row g-4" { @for d in &page.items { div class="col-lg-6" { section class="card h-100" { div class="card-header" { h2 class="card-title" { (d.name) } span class="badge bg-secondary-lt ms-auto" { "epoch " (d.epoch) } }
             div class="card-body" {
-                dl class="row" { dt class="col-sm-4" { "Active version" } dd class="col-sm-8" { code { (d.active) } } dt class="col-sm-4" { "Versions" } dd class="col-sm-8" { (d.versions.join(", ")) }
-                    dt class="col-sm-4" { "Schedule" } dd class="col-sm-8" { (d.schedule.as_deref().unwrap_or("No schedule")) @if d.tripped.is_some() { " · suspended" } }
+                dl class="row" { dt class="col-sm-4" { "Active version" } dd class="col-sm-8" { code { (d.active.as_deref().unwrap_or("none")) } }
+                    dt class="col-sm-4" { "Versions" } dd class="col-sm-8" { @for (n, v) in d.versions.iter().enumerate() { @if n > 0 { ", " } span title=(v.activated_ms.map(time).unwrap_or_else(|| "activation time not recorded".into())) { (v.version) } } }
+                    dt class="col-sm-4" { "Schedule" } dd class="col-sm-8" { @if d.schedules.is_empty() { "No schedule" } @for s in &d.schedules { (schedule_info(s, matches!(d.tripped, Some(Trip::Manual { .. })))) } }
                     dt class="col-sm-4" { "Breaker" } dd class="col-sm-8" { @match &d.tripped {
                         None => { span class="badge bg-green-lt" { "healthy" } " · " (d.faults) " consecutive faults" },
-                        Some(Trip::Automatic {faults,threshold,run,error}) => { span class="badge bg-red-lt" { "automatically tripped" } p class="mt-2" { (faults) " / " (threshold) " faults · " a href=(format!("/runs/{run}")) { (run) } } p { (error) } p class="text-secondary small" { "Activate a version in the host to clear this trip." } },
-                        Some(Trip::Manual {actor,reason,note}) => { span class="badge bg-yellow-lt" { "manually paused" } p class="mt-2" { "By " (actor) " · " (reason) } p class="text-secondary" { (note) } },
+                        Some(Trip::Automatic {faults,threshold,run,error,at_ms}) => { span class="badge bg-red-lt" { "automatically tripped" } " " span class="text-secondary small" title=(time(*at_ms)) { (age(*at_ms)) } p class="mt-2" { (faults) " / " (threshold) " faults · " a href=(format!("/runs/{run}")) { (run) } } p { (error) } p class="text-secondary small" { "Activate a version in the host to clear this trip." } },
+                        Some(Trip::Manual {actor,reason,note,at_ms}) => { span class="badge bg-yellow-lt" { "manually paused" } " " span class="text-secondary small" title=(time(*at_ms)) { (age(*at_ms)) } p class="mt-2" { "By " (actor) " · " (reason) } p class="text-secondary" { (note) } },
                     } }
                 }
                 @if !app.session.read_only { @match &d.tripped {
@@ -524,19 +589,32 @@ async fn definitions(State(app): State<App>) -> Result<Markup> {
                 } }
             }
         } } } }
+        @if page.items.is_empty() { div class="card card-body text-secondary" { "No definitions in this page." } }
+        (next_link("/definitions", q, page.next))
     }).await
 }
-async fn workers(State(app): State<App>) -> Result<Markup> {
-    let workers = app.session.client.workers().await?;
-    layout(&app,"Workers","Heartbeat snapshots from the host. A heartbeat older than 30 seconds is stale.",html! {
-        @match workers { Workers::Unavailable { reason } => { div class="alert alert-info" { (reason) } }, Workers::Available(workers) => {
+async fn workers(State(app): State<App>, Query(q): Query<PageQuery>) -> Result<Markup> {
+    let page = app
+        .session
+        .client
+        .workers(q.cursor.as_ref(), q.limit.unwrap_or(50))
+        .await?;
+    layout(&app,"Workers","Heartbeat rows the workers write. A worker that does not beat again before its expiry is stale.",html! {
         section class="card" { div class="table-responsive" { table class="table card-table table-vcenter" {
-            thead { tr { th { "Worker" } th { "Heartbeat" } th { "RSS" } th { "CPU" } th { "Runs held" } } }
-            tbody { @for w in workers { tr { td { strong { (w.id) } } td title=(time(w.heartbeat_ms)) { (age(w.heartbeat_ms)) " " @if now_ms()-w.heartbeat_ms>30_000 { span class="badge bg-red-lt" { "stale" } } @else { span class="badge bg-green-lt" { "healthy" } } }
-                td { (w.rss_bytes/1_048_576) " MiB" } td { (format!("{:.1}%",w.cpu_percent)) } td { @for id in w.runs_held { a class="me-2" href=(format!("/runs/{id}")) { (id) } } }
-            } } }
+            thead { tr { th { "Worker" } th { "Liveness" } th { "Last beat" } th { "Runs held" } th { "Application version" } th { "Host" } th { "Started" } } }
+            tbody { @for w in &page.items { tr {
+                td { strong class="font-monospace" { (w.id) } }
+                td { @if w.stale { span class="badge bg-red-lt" { "stale" } } @else { span class="badge bg-green-lt" { "live" } } }
+                td title=(time(w.beat_ms)) { (age(w.beat_ms)) div class="text-secondary small" title=(time(w.expires_ms)) { @if w.stale { "expired " } @else { "expires " } (time(w.expires_ms)) } }
+                td { (w.held) }
+                td { @if let Some(v) = &w.application { code { (v) } } @else { span class="text-secondary" { "undeclared" } } }
+                td { (w.host.as_deref().unwrap_or("—")) }
+                td title=(time(w.started_ms)) { (age(w.started_ms)) }
+            } }
+            @if page.items.is_empty() { tr { td colspan="7" class="text-secondary p-4" { "No worker heartbeat rows in this page." } } }
+            }
         } } }
-        } }
+        (next_link("/workers", q, page.next))
     }).await
 }
 #[derive(Deserialize, Serialize)]

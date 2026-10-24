@@ -57,8 +57,11 @@ pub enum Action {
         run: String,
     },
     Pending(PendingArgs),
-    Definitions,
-    Workers,
+    Definitions(PageArgs),
+    Definition {
+        name: String,
+    },
+    Workers(PageArgs),
     Journal {
         #[arg(long)]
         run: Option<String>,
@@ -149,6 +152,13 @@ impl RunArgs {
             before_ms: self.before_ms,
         }
     }
+}
+#[derive(Debug, Args)]
+pub struct PageArgs {
+    #[arg(long)]
+    pub cursor: Option<String>,
+    #[arg(long, default_value_t = 50)]
+    pub limit: usize,
 }
 #[derive(Debug, Args)]
 pub struct PendingArgs {
@@ -306,8 +316,22 @@ pub async fn execute(session: &Session, action: Action) -> Result<Value> {
                 .await?,
             );
         }
-        Action::Definitions => return json(c.definitions().await?),
-        Action::Workers => return json(c.workers().await?),
+        Action::Definitions(p) => {
+            return json(
+                c.definitions(p.cursor.map(Cursor).as_ref(), p.limit)
+                    .await?,
+            );
+        }
+        Action::Definition { name } => {
+            return json(
+                c.definition(&name)
+                    .await?
+                    .ok_or_else(|| ControlError::NotFound("definition not found".into()))?,
+            );
+        }
+        Action::Workers(p) => {
+            return json(c.workers(p.cursor.map(Cursor).as_ref(), p.limit).await?);
+        }
         Action::Journal { run, cursor, limit } => {
             return json(
                 c.journal(run.as_deref(), cursor.map(Cursor).as_ref(), limit)

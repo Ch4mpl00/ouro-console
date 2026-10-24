@@ -171,6 +171,10 @@ pub struct CallEntry {
     pub state: String,
     pub arguments: Value,
     pub result: Option<Value>,
+    /// What the call's answer carried beside its result: numbers or short
+    /// strings by name (token counts under the GenAI names, a cost).
+    #[serde(default)]
+    pub annotations: BTreeMap<String, Value>,
 }
 /// Presentation projection, not a substitute for ouro's expression-based matcher.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -199,9 +203,13 @@ pub struct Inspection {
     pub waits: BTreeMap<String, PendingWait>,
     pub mailbox: Vec<Value>,
     pub calls: Vec<CallEntry>,
+    /// The calls' numeric annotations summed per name, as ouro computes them.
+    #[serde(default)]
+    pub annotations: BTreeMap<String, serde_json::Number>,
     pub children: Vec<SavedRun>,
     pub budget_spent: u64,
     pub budget_limit: Option<u64>,
+    /// The span context the run was admitted in, when there was one.
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
 }
@@ -212,37 +220,60 @@ pub enum Trip {
         actor: String,
         reason: String,
         note: String,
+        at_ms: i64,
     },
     Automatic {
         faults: u32,
         threshold: u32,
         run: String,
         error: String,
+        at_ms: i64,
     },
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Version {
+    pub version: String,
+    /// None when the catalog did not record the activation instant.
+    pub activated_ms: Option<i64>,
+}
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct QueuedSlot {
+    pub run: String,
+    pub version: String,
+}
+/// One schedule kind configured by the active version.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Schedule {
+    pub kind: String,
+    pub next_due_ms: Option<i64>,
+    pub overlap: String,
+    pub catchup: String,
+    pub queued: Option<QueuedSlot>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Definition {
     pub name: String,
-    pub versions: Vec<String>,
-    pub active: String,
+    pub versions: Vec<Version>,
+    pub active: Option<String>,
     pub epoch: u64,
     pub faults: u32,
     pub tripped: Option<Trip>,
-    pub schedule: Option<String>,
+    pub schedules: Vec<Schedule>,
 }
+/// A worker's heartbeat row. `stale` is decided by the backend's clock: the
+/// worker did not beat again before `expires_ms`.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Worker {
     pub id: String,
-    pub heartbeat_ms: i64,
-    pub rss_bytes: u64,
-    pub cpu_percent: f64,
-    pub runs_held: Vec<String>,
-}
-#[derive(Clone, Debug, Serialize, Deserialize)]
-#[serde(tag = "status", content = "data", rename_all = "snake_case")]
-pub enum Workers {
-    Available(Vec<Worker>),
-    Unavailable { reason: String },
+    pub host: Option<String>,
+    /// The application version the worker declares.
+    pub application: Option<String>,
+    pub started_ms: i64,
+    pub beat_ms: i64,
+    pub expires_ms: i64,
+    /// How many runs it was executing at its last beat.
+    pub held: u64,
+    pub stale: bool,
 }
 
 #[async_trait]
@@ -283,8 +314,9 @@ pub trait ControlClient: Send + Sync {
         cursor: Option<&Cursor>,
         limit: usize,
     ) -> Result<Page<Entry>>;
-    async fn definitions(&self) -> Result<Vec<Definition>>;
-    async fn workers(&self) -> Result<Workers>;
+    async fn definitions(&self, cursor: Option<&Cursor>, limit: usize) -> Result<Page<Definition>>;
+    async fn definition(&self, name: &str) -> Result<Option<Definition>>;
+    async fn workers(&self, cursor: Option<&Cursor>, limit: usize) -> Result<Page<Worker>>;
     async fn cancel(&self, request: &Request, run: &str) -> Result<Reply> {
         self.execute(request, &Command::Cancel { run: run.into() })
             .await
