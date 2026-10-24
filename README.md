@@ -259,7 +259,8 @@ console delegates transactional cancellation, pause/resume, emergency stop,
 response matching and identity, and attributed idempotent receipts to `Control`.
 It does not retry ambiguous writes. This pin exports operator validation errors
 as `anyhow` messages: known messages map to invalid/not-found/conflict errors;
-unknown storage failures remain internal errors.
+unknown storage failures remain internal errors. Storage error text includes the
+underlying cause chain, including Postgres's database diagnosis.
 
 `RunStore::definitions(name)` provides versions, active version, epoch, faults
 and manual/automatic trips. At this pin it has no name-list API, so catalog

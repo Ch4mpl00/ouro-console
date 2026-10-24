@@ -274,3 +274,19 @@ common::backend_tests!(
     mcp_rejects_missing_or_blank_reasons_for_every_write,
     read_only_mcp_exposes_and_accepts_only_reads
 );
+
+#[tokio::test]
+#[ignore = "requires TEST_DATABASE_URL (isolated schemas)"]
+async fn postgres_errors_include_database_diagnosis_over_http() {
+    let backend = Backend::postgres();
+    let (app, _) = setup(false, &backend).await;
+    // Deliberately pass an invalid Postgres text value to exercise a real error chain.
+    let reply = call(&app, "inspect_run", json!({"run":"invalid\0id"})).await;
+    assert_eq!(reply["result"]["isError"], true, "{reply}");
+    assert_eq!(
+        reply["result"]["content"][0]["text"],
+        "db error: ERROR: invalid byte sequence for encoding \"UTF8\": 0x00",
+        "{reply}"
+    );
+    backend.cleanup().await;
+}

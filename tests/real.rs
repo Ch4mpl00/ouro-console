@@ -521,6 +521,46 @@ async fn read_only_connection_reads_without_mutating_or_migrating(backend: Backe
     ));
     assert_eq!(real.backend.snapshot().await.unwrap(), before);
 }
+
+async fn definition_catalog_spans_pages_in_both_access_modes(backend: Backend) {
+    let fixture = Fixture::new(&backend).await;
+    let real = fixture.real.as_ref().unwrap();
+    let yaml = "document: { dsl: '1.0.4', namespace: test, name: workflow, version: '1.0.0' }\ndo:\n  - done: { set: { ok: true } }\n";
+    let mut expected: Vec<_> = fixture
+        .definitions()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    // Cross the 256-row boundary; adjacent prefix keys must remain distinct.
+    let names = (0..260)
+        .map(|i| format!("catalog-{i:03}"))
+        .chain(["catalog-255-child".into(), "catalog-255-é".into()]);
+    for name in names {
+        real.runtime.save(&name, yaml).await.unwrap();
+        expected.push(name);
+    }
+    expected.sort();
+    for read_only in [false, true] {
+        let client = OuroControl::connect(fixture.spec.as_deref().unwrap(), read_only)
+            .await
+            .unwrap();
+        let names: Vec<_> = client
+            .definitions()
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|d| d.name)
+            .collect();
+        assert_eq!(names, expected, "read_only={read_only}");
+    }
+}
+
+#[tokio::test]
+async fn sqlite_definition_catalog_spans_pages_in_both_access_modes() {
+    definition_catalog_spans_pages_in_both_access_modes(Backend::Sqlite).await;
+}
 #[tokio::test]
 async fn sqlite_http_cancel_and_respond_are_observed_by_the_runtime() {
     http_cancel_and_respond_are_observed_by_the_runtime(Backend::Sqlite).await;
@@ -616,6 +656,7 @@ async fn postgres_real_store_contract_and_http_end_to_end() {
     opaque_paging_mappings_and_error_classification(backend.clone()).await;
     read_only_connection_reads_without_mutating_or_migrating(backend.clone()).await;
     complex_wait_progress_and_response_replay_are_owned_by_ouro(backend.clone()).await;
+    definition_catalog_spans_pages_in_both_access_modes(backend.clone()).await;
     backend.cleanup().await;
 }
 

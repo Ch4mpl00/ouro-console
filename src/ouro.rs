@@ -95,7 +95,9 @@ pub(crate) fn storage_error(error: anyhow::Error) -> ControlError {
         | "cursor belongs to another query" => ControlError::Invalid(message),
         _ if message.starts_with("unknown run ") => ControlError::NotFound(message),
         _ if message.starts_with("page limit must be ") => ControlError::Invalid(message),
-        _ => ControlError::Internal(message),
+        // Display preserves only the outer message (e.g. tokio-postgres's "db error").
+        // Keep the sources so operators can see the database's actual diagnosis.
+        _ => ControlError::Internal(format!("{error:#}")),
     }
 }
 fn value(value: impl Serialize) -> Result<Value> {
@@ -438,18 +440,25 @@ impl ControlClient for OuroControl {
         // Scan only catalog keys in bounded chunks; decode versions through RunStore.
         let mut tx = self.catalog.begin().await.map_err(storage_error)?;
         let mut names = Vec::new();
-        let mut start = String::new();
+        let mut start = None;
         loop {
             let rows = tx
-                .scan("definitions", &start, None, 256)
+                .scan("definitions", start.as_deref().unwrap_or(""), None, 256)
                 .await
                 .map_err(storage_error)?;
-            if rows.is_empty() {
-                break;
-            }
+            let mut advanced = false;
             for ((_, name), _) in rows {
-                start = format!("{name}\0");
+                // scan has an inclusive lower bound. Reuse the actual key and
+                // skip its overlap: Postgres text cannot contain a NUL suffix.
+                if start.as_ref() == Some(&name) {
+                    continue;
+                }
+                start = Some(name.clone());
                 names.push(name);
+                advanced = true;
+            }
+            if !advanced {
+                break;
             }
         }
         tx.rollback().await;
@@ -504,5 +513,23 @@ impl ControlClient for OuroControl {
         Ok(Workers::Unavailable {
             reason: "Worker heartbeats are not available yet (ouro#20).".into(),
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn storage_errors_preserve_the_source_chain_and_remain_internal() {
+        let error = anyhow::Error::new(std::io::Error::other("underlying storage failure"))
+            .context("db error")
+            .context("reading definitions");
+        let error = storage_error(error);
+        assert!(matches!(error, ControlError::Internal(_)));
+        assert_eq!(
+            error.to_string(),
+            "reading definitions: db error: underlying storage failure"
+        );
     }
 }
