@@ -4,34 +4,76 @@ An operations console for [ouro](https://github.com/Ch4mpl00/ouro): inspect runs
 answer pending decisions, and stop work through a web UI, MCP tools, or scripts.
 Rust 2024, one binary, no Node build and no CDN requests at runtime.
 
-**This scaffold uses an in-memory fake.** It has no ouro crate dependencies and
-never opens a runtime store. Each process starts with fresh demo data. Web and
-MCP share that process's client; a separate CLI invocation gets a fresh fake,
-so a script command does **not** affect a running demo server. The fake does not
-execute workflows or simulate worker heartbeats. Actions change its state and
-operator journal until that process exits.
+`OuroControl` connects directly to ouro's async control API over a SQLite or
+Postgres store. Web, MCP, and separate CLI processes address the same persistent
+state when configured with the same store. The console observes and controls
+runs; the embedding ouro host still admits and drives workflows.
+
+`ouro-runtime` and `ouro-durable` are pinned to Git revision `2bd26cd`
+(`2bd26cdeaf53ea0a664fdfbbef31a4898b872dce`). `ows` types come through
+`ouro-runtime`'s reexport. `--fake` remains available for process-local demos.
 
 ## Run
 
 Requires Rust 1.90 or newer. With the binary on your PATH:
 
 ```sh
-ouro-console serve --fake
+ouro-console serve --store sqlite:/var/lib/ouro/runs.sqlite
 # http://127.0.0.1:8090
 
+export OURO_STORE='sqlite:/var/lib/ouro/runs.sqlite'
+ouro-console runs --limit 50
+ouro-console serve --read-only
+
+# The prefix selects the adapter; the remainder is the database URL.
+ouro-console serve --store 'postgres:postgresql://operator@localhost/ouro'
+
+# Demos use fresh in-memory data for each process.
+unset OURO_STORE
+ouro-console serve --fake
 ouro-console serve --fake --read-only
 ouro-console serve --fake --actor operator \
   --trace-url 'https://traces.example/trace/{trace_id}'
 ```
 
-For a checkout, `cargo run -- serve --fake` runs the same binary. There are no
-asset generation steps. The default backend is the fake; `--fake` makes that
-choice explicit. A theme button switches between light and dark, starts from
-the system preference, and remembers the selection locally.
+Choose `--store` (or `OURO_STORE`) or `--fake`; there is no implicit backend.
+`--store` overrides `OURO_STORE`; `--fake` conflicts with a selected store
+(including the environment). Backend status messages do not print connection URLs.
+For a checkout, `cargo run -- serve --store sqlite:/path/to/runs.sqlite` runs
+the same binary. There are no asset generation steps. A theme button switches
+between light and dark, starts from the system preference, and remembers the
+selection locally.
+
+Writable connections use ouro's own SQLite/Postgres constructors, including
+schema initialization/migration. Back up a store before opening it with a new
+ouro version. The pinned Postgres adapter uses `NoTls`; use a local database or
+secure tunnel. Database connections are separate from HTTP bearer protection.
+
+### Read-only deployment
+
+`--read-only` hides web actions, rejects HTTP/CLI commands, and exposes only MCP
+reads. `OuroControl` also refuses writes at its boundary. Read-only connections
+require an existing, initialized schema and bypass ouro's migrating constructors:
+SQLite opens with `SQLITE_OPEN_READ_ONLY` and deferred read transactions;
+Postgres uses serializable `READ ONLY` transactions. Neither transport issues
+DDL, row writes, or migrations. The shared ouro engine interprets the data.
+
+Use a **read-only database user** for real protection. For Postgres, grant only
+CONNECT, schema USAGE, and SELECT on `ouro_rows` and `ouro_migrations`, with no
+CREATE or data modification privileges; `default_transaction_read_only=on` is
+an additional safeguard. Provision the schema using the host's writable role
+first. For SQLite, restrict the console account's filesystem access and keep
+WAL/SHM files accessible for live reads. Console mode flags are not a substitute
+for database permissions or deployment authentication.
 
 The demo includes `review`, `transform`, `archive`, and `cleanup` definitions,
 every run state, a three-level owned tree, open decision/signal waits, an
 automatic breaker trip, a manual pause, and healthy/stale heartbeat snapshots.
+Demo actions last until that process exits;
+a separate demo CLI process does not affect a demo server. The fake executes no
+workflows or heartbeat updates. Real stores currently have no worker heartbeat
+rows: `/workers`, `workers`, and `list_workers` explicitly report **not available
+yet (ouro#20)**. The trait method remains available for future support.
 
 ## Web UI
 
@@ -41,7 +83,7 @@ automatic breaker trip, a manual pause, and healthy/stale heartbeat snapshots.
 | `/runs/{id}` | State/version, lease holder and expiry, exact waits, call journal with delivery/states/arguments/results, jump budget, owned descendants including ended children, mailbox, configured trace link, cancel/cancel tree |
 | `/pending` | What runs wait for, matcher/progress/correlation expectations, since time, absolute timeout, approve/reject or JSON data answers |
 | `/definitions` | Versions, active version, epoch, fault count, automatic breaker/manual pause attribution, schedule, pause/resume |
-| `/workers` | Heartbeat age, stale after 30 seconds, RSS, CPU, runs held |
+| `/workers` | Explicit unavailable state for real stores until ouro#20; heartbeat/resource snapshots in demos |
 | `/journal` | Request ID, actor, reason, command, committed reply; optional `?run=…` |
 | `/emergency` | Always accessible from the red header control; current stop flag, confirmed stop/resume with required reason |
 
@@ -94,8 +136,8 @@ ouro-console serve --fake --bind 0.0.0.0:8090 --token-file /secure/console-token
 `--token-file` / `OURO_CONSOLE_TOKEN_FILE` takes precedence over
 `OURO_CONSOLE_TOKEN`. `--actor` / `OURO_CONSOLE_ACTOR` takes precedence over the
 file's actor; otherwise the actor is `local-operator`.
-`--read-only`, `--fake`, `--token-file`, `--actor`, and `--trace-url` are global
-flags and may appear after the subcommand. `OURO_CONSOLE_TRACE_URL` is also
+`--store`, `--read-only`, `--fake`, `--token-file`, `--actor`, and `--trace-url`
+are global flags and may appear after the subcommand. `OURO_CONSOLE_TRACE_URL` is also
 supported. Trace templates must be HTTP(S) and contain `{trace_id}`; identifiers
 are encoded before substitution.
 
@@ -136,8 +178,9 @@ For example:
 The fake validates routing types, projected top-level correlation expectations,
 timeouts, closed waits, redacted waits and event identity conflicts. It models
 single-position demo waits, not ouro's expression matcher or incremental
-multi-filter consumption. The real adapter must delegate matching and response
-identity handling to ouro. The web form creates a CloudEvent using the wait's
+multi-filter consumption. The real adapter delegates matching and response
+identity handling to ouro, including incremental multi-event consumption. The
+web form creates a CloudEvent using the wait's
 type, subject and request ID, with approve/reject or custom JSON as `data`.
 Wildcard/complex events can be sent through MCP or CLI.
 
@@ -145,10 +188,12 @@ Wildcard/complex events can be sent through MCP or CLI.
 
 Script commands emit JSON to stdout, diagnostics to stderr, and a nonzero exit
 status on error. They dispatch through the same async `ControlClient` and
-read-only policy as the web and MCP surfaces. **Each invocation currently starts
-a fresh fake**; store/remote connectivity is a later step.
+read-only policy as the web and MCP surfaces. Set `OURO_STORE` or pass `--store`
+to every invocation. Use run IDs and exact wait keys returned by `pending`;
+the sample IDs below illustrate the demo data.
 
 ```sh
+export OURO_STORE='sqlite:/var/lib/ouro/runs.sqlite'
 ouro-console runs --state running --definition review --limit 50
 ouro-console history --since-ms 0 --before-ms 1800000000000
 ouro-console inspect run-002
@@ -178,6 +223,8 @@ supports definition, run, event type, time bounds, and cursor. Counts supports
 
 - `src/client.rs`: console-owned DTOs, object-safe async `ControlClient`, shared
   authorization/attribution `Session`, errors.
+- `src/ouro.rs`: typed control/store adapter, opaque cursor transport, definition catalog.
+- `src/readonly.rs`: non-migrating read-only database transports for ouro's transaction seam.
 - `src/fake.rs`: process-local fixtures, atomic state changes, query-bound
   continuations, audit and response identity deduplication.
 - `src/web.rs`: axum routes/middleware, Maud pages/forms, embedded assets.
@@ -194,35 +241,82 @@ Tabler provides the admin UI, light/dark variables, JavaScript and icons.
 `rust-embed` includes all assets in the binary (including debug/test builds);
 there are no runtime filesystem asset dependencies.
 
-## Real client roadmap
+## Runtime mapping and remaining gaps
 
-ouro's store/runtime seams are moving to async (ouro#7). The console deliberately
-has no dependency on that work's intermediate signatures.
+The console keeps its own view types. Numeric ouro version IDs are displayed as
+strings (`"none"` for an inactive definition). All six run states, lease
+ownership/expiry, call arguments/results and delivery states, mailbox metadata,
+owned descendants, budget evidence and existing trace/span IDs are projected
+from `Control::inspect`. No trace IDs or worker records are invented. Wait
+positions remain strings; strategies, matcher filters and incremental progress
+are displayed without evaluating expressions. Complex or wildcard responses
+can be submitted as complete CloudEvents through MCP/CLI. A response becomes
+workflow progress when an ouro host drives the run again.
 
-Implement `ControlClient` in a future `OuroControl` adapter over the finalized
-async `ouro_runtime::control::Control`, with injected store and clock. Map all
-console-owned DTOs to/from ouro's types and keep real cursors opaque and
-query-bound. Delegate cancellation, pause/resume, stop enforcement, command
-idempotency/audit, and exact persisted wait matching to the control service.
-Preserve error classification and original request IDs/replies across ambiguous
-retries. Expand the wait projection for complex matchers without interpreting
-ouro expressions in the console.
+Cursors are URL-safe base64 wrappers around ouro's serialized opaque cursor.
+They are passed back unchanged to ouro, which enforces query binding. The
+console delegates transactional cancellation, pause/resume, emergency stop,
+response matching and identity, and attributed idempotent receipts to `Control`.
+It does not retry ambiguous writes. This pin exports operator validation errors
+as `anyhow` messages: known messages map to invalid/not-found/conflict errors;
+unknown storage failures remain internal errors.
 
-Definitions and worker heartbeat/resource catalogs need a host/store adapter;
-workers/telemetry are adjacent to ouro#20, not methods currently supplied by
-`Control`. Trace IDs are host-pinned and must be passed through. Add persistent
-store or remote connection configuration so server and scripts address the same
-backend, integration tests against ouro's adapters, and deployment auth/TLS
-examples. Version activation, metrics dashboards, Grafana/Tempo compose examples,
-workflow editing and application-specific views are outside v1.
+`RunStore::definitions(name)` provides versions, active version, epoch, faults
+and manual/automatic trips. At this pin it has no name-list API, so catalog
+names are scanned through the public `AtomicBackend` seam in chunks of 256,
+then decoded using the definitions API. Schedule JSON comes from the active
+version's parsed definition. Catalog entries can change between observations.
+
+Worker heartbeats/resources remain unavailable until [ouro#20](https://github.com/Ch4mpl00/ouro/issues/20).
+Version activation, workflow editing, metrics dashboards and host-specific views
+remain outside v1. The console does not run a workflow worker. Store-only
+cancellation changes durable state; the host observes it at its execution gates.
+
+### Developing against an ouro checkout (no `[patch]`)
+
+For local experiments, temporarily replace just these two dependency lines in
+`Cargo.toml` with paths to a sibling checkout:
+
+```toml
+ouro-runtime = { path = "../ouro/crates/runtime" }
+ouro-durable = { path = "../ouro/crates/durable" }
+```
+
+`ows` follows the runtime's own local dependency. Keep both declarations from
+the same checkout. Cargo updates `Cargo.lock` for those sources when running
+checks; restore the Git declarations and lockfile before committing console
+changes. No `[patch]` section or modification to the ouro checkout is needed.
 
 ## Checks
 
 ```sh
+export CARGO_HOME=/private/tmp/ouro-cargo
+# If libgit2 cannot negotiate HTTPS in your environment:
+export CARGO_NET_GIT_FETCH_WITH_CLI=true
 cargo fmt --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 ```
+
+The existing page/action, MCP transport and CLI dispatch suites run against
+both `FakeControl` and `OuroControl` on temporary SQLite files. Real fixtures
+use ouro's `Runtime` to save/activate definitions, admit and drive workflows,
+create owned children, pause a definition, and cancel a run. A persisted lease
+provides a running view. Tests also cover independent-process CLI selection,
+opaque paging, mapping/error behavior, read-only non-migration, and HTTP actions
+observed through ouro's API, including driving a responded wait to completion.
+
+Postgres variants are ignored by default. With a disposable test database whose
+role can create/drop schemas, run the same cases plus the real-store contract:
+
+```sh
+TEST_DATABASE_URL='postgresql://tester@localhost/ouro_test' \
+  cargo test postgres -- --ignored
+```
+
+Each fixture creates a random schema and successful tests remove their schemas;
+a failing test may leave its `console_test_…` schema for inspection. Existing
+schemas and runtime data are never truncated.
 
 No console license has been selected yet. Third-party vendored license notices
 are included under `assets/vendor/`; see its inventory for versions and sources.
