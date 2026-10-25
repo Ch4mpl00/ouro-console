@@ -2,7 +2,7 @@
 use crate::client::*;
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::URL_SAFE_NO_PAD};
-use ouro_durable::{Clock, RunStore, TransactionalStore};
+use ouro_durable::{Clock, RunStore};
 use ouro_runtime::{control as api, ows};
 use serde::Serialize;
 use serde_json::Value;
@@ -21,36 +21,33 @@ impl OuroControl {
             read_only,
         }
     }
-    /// Writable adapters migrate on open. Read-only adapters require an existing schema.
+    /// Writable adapters migrate on open. Read-only adapters never migrate or
+    /// write; they refuse an unmigrated or newer store with ouro's
+    /// `SchemaError`, which surfaces as `ControlError::Unavailable`.
     pub async fn connect(spec: &str, read_only: bool) -> Result<Self> {
         let invalid =
             || ControlError::Invalid("store must be sqlite:<path> or postgres:<url>".into());
         let sqlite = spec.strip_prefix("sqlite:").filter(|p| !p.is_empty());
         let postgres = spec.strip_prefix("postgres:").filter(|p| !p.is_empty());
-        let store: Arc<dyn RunStore> = if read_only {
-            if sqlite.is_none() && postgres.is_none() {
-                return Err(invalid());
-            }
-            // ouro's own constructors create and migrate the schema, so the
-            // read-only mode supplies its own non-migrating transport.
-            let backend = crate::readonly::ReadBackend::open(spec)
-                .await
-                .map_err(storage_error)?;
-            Arc::new(TransactionalStore::new(Arc::new(backend)))
-        } else if let Some(path) = sqlite {
+        let store: Arc<dyn RunStore> = if let Some(path) = sqlite {
             let path = path.to_owned();
-            Arc::new(
-                tokio::task::spawn_blocking(move || ouro_durable::sqlite::open(path))
-                    .await
-                    .map_err(|e| ControlError::Internal(e.to_string()))?
-                    .map_err(storage_error)?,
-            )
+            let opened = tokio::task::spawn_blocking(move || {
+                if read_only {
+                    ouro_durable::sqlite::open_read_only(path)
+                } else {
+                    ouro_durable::sqlite::open(path)
+                }
+            })
+            .await
+            .map_err(|e| ControlError::Internal(e.to_string()))?;
+            Arc::new(opened.map_err(storage_error)?)
         } else if let Some(url) = postgres {
-            Arc::new(
-                ouro_durable::postgres::connect(url)
-                    .await
-                    .map_err(storage_error)?,
-            )
+            let opened = if read_only {
+                ouro_durable::postgres::connect_read_only(url).await
+            } else {
+                ouro_durable::postgres::connect(url).await
+            };
+            Arc::new(opened.map_err(storage_error)?)
         } else {
             return Err(invalid());
         };
@@ -62,33 +59,30 @@ impl OuroControl {
     }
 }
 
-// At this pin operator errors are anyhow strings, not exported typed errors.
-// Match only known messages; never classify unknown I/O/ambiguous commits as retryable.
+/// Failures from ouro's control API (or a store open), by variant. Unknown
+/// storage failures are never classified as retryable.
 pub(crate) fn storage_error(error: anyhow::Error) -> ControlError {
-    let message = error.to_string();
-    match message.as_str() {
-        "control request identity conflict"
-        | "response event identity conflict"
-        | "event identity conflict"
-        | "a breaker trip requires activation"
-        | "wait is no longer pending"
-        | "wait ended or timed out"
-        | "response event already consumed by another wait"
-        | "wait matching requires redacted secrets" => ControlError::Conflict(message),
-        "unknown definition" => ControlError::NotFound(message),
-        "control request requires id, actor and reason"
-        | "response requires event source and id"
-        | "event does not match wait"
-        | "definition has no active version"
-        | "history requires a bounded time window"
-        | "counts require a definition"
-        | "invalid time window"
-        | "cursor belongs to another query" => ControlError::Invalid(message),
-        _ if message.starts_with("unknown run ") => ControlError::NotFound(message),
-        _ if message.starts_with("page limit must be ") => ControlError::Invalid(message),
-        // Display preserves only the outer message (e.g. tokio-postgres's "db error").
-        // Keep the sources so operators can see the database's actual diagnosis.
-        _ => ControlError::Internal(format!("{error:#}")),
+    control_error(api::ControlError::from(error))
+}
+fn control_error(error: api::ControlError) -> ControlError {
+    use api::ControlError as E;
+    match error {
+        E::NotFound { .. } => ControlError::NotFound(error.to_string()),
+        E::RequestConflict { .. }
+        | E::ResponseConflict { .. }
+        | E::InvalidState(_)
+        | E::WaitClosed { .. }
+        | E::Stopped => ControlError::Conflict(error.to_string()),
+        E::WaitMismatch { .. } | E::InvalidInput(_) => ControlError::Invalid(error.to_string()),
+        E::ReadOnly => ControlError::ReadOnly,
+        E::Storage(source) => match source.downcast_ref::<ouro_durable::SchemaError>() {
+            Some(schema) => ControlError::Unavailable(format!("store unavailable: {schema}")),
+            // Display preserves only the outer message (e.g. tokio-postgres's "db error").
+            // Keep the sources so operators can see the database's actual diagnosis.
+            None => ControlError::Internal(format!("{source:#}")),
+        },
+        // `ControlError` is non-exhaustive: a variant this build does not know.
+        other => ControlError::Internal(other.to_string()),
     }
 }
 fn value(value: impl Serialize) -> Result<Value> {
@@ -203,6 +197,7 @@ fn saved(run: ouro_durable::SavedRun) -> Result<SavedRun> {
         ended_ms: run.ended_ms,
         parent: run.child.map(|c| c.parent),
         error,
+        annotations: run.annotations,
     })
 }
 fn waiting(wait: ows::events::PendingWait) -> Result<PendingWait> {
@@ -335,16 +330,16 @@ impl ControlClient for OuroControl {
             )
             .await
             .map(reply)
-            .map_err(storage_error)
+            .map_err(control_error)
     }
     async fn stopped(&self) -> Result<bool> {
-        self.control.stopped().await.map_err(storage_error)
+        self.control.stopped().await.map_err(control_error)
     }
     async fn inspect(&self, run: &str) -> Result<Option<Inspection>> {
         self.control
             .inspect(run)
             .await
-            .map_err(storage_error)?
+            .map_err(control_error)?
             .map(inspection)
             .transpose()
     }
@@ -358,7 +353,7 @@ impl ControlClient for OuroControl {
             self.control
                 .list(&runs(filter), cursor(c)?.as_ref(), limit)
                 .await
-                .map_err(storage_error)?,
+                .map_err(control_error)?,
             saved,
         )
     }
@@ -372,7 +367,7 @@ impl ControlClient for OuroControl {
             self.control
                 .history(&runs(filter), cursor(c)?.as_ref(), limit)
                 .await
-                .map_err(storage_error)?,
+                .map_err(control_error)?,
             saved,
         )
     }
@@ -388,7 +383,7 @@ impl ControlClient for OuroControl {
             self.control
                 .waits(&filter, cursor(c)?.as_ref(), limit)
                 .await
-                .map_err(storage_error)?,
+                .map_err(control_error)?,
             |w| {
                 Ok(Wait {
                     run: w.run,
@@ -410,7 +405,7 @@ impl ControlClient for OuroControl {
             .control
             .counts(&runs(filter), history, cursor(c)?.as_ref(), limit)
             .await
-            .map_err(storage_error)?;
+            .map_err(control_error)?;
         Ok(Counts {
             states: counts.states,
             next: next(counts.next)?,
@@ -421,7 +416,7 @@ impl ControlClient for OuroControl {
             .control
             .entry(id)
             .await
-            .map_err(storage_error)?
+            .map_err(control_error)?
             .map(entry))
     }
     async fn journal(
@@ -434,7 +429,7 @@ impl ControlClient for OuroControl {
             self.control
                 .journal(run, cursor(c)?.as_ref(), limit)
                 .await
-                .map_err(storage_error)?,
+                .map_err(control_error)?,
             |e| Ok(entry(e)),
         )
     }
@@ -443,7 +438,7 @@ impl ControlClient for OuroControl {
             self.control
                 .definitions(cursor(c)?.as_ref(), limit)
                 .await
-                .map_err(storage_error)?,
+                .map_err(control_error)?,
             definition,
         )
     }
@@ -451,7 +446,7 @@ impl ControlClient for OuroControl {
         self.control
             .definition(name)
             .await
-            .map_err(storage_error)?
+            .map_err(control_error)?
             .map(definition)
             .transpose()
     }
@@ -460,7 +455,7 @@ impl ControlClient for OuroControl {
             self.control
                 .workers(cursor(c)?.as_ref(), limit)
                 .await
-                .map_err(storage_error)?,
+                .map_err(control_error)?,
             |status| {
                 let w = status.worker;
                 Ok(Worker {
@@ -475,6 +470,25 @@ impl ControlClient for OuroControl {
                 })
             },
         )
+    }
+    async fn totals(
+        &self,
+        definition: &str,
+        since_ms: i64,
+        before_ms: i64,
+    ) -> Result<DefinitionTotals> {
+        let totals = self
+            .control
+            .totals(definition, since_ms, before_ms)
+            .await
+            .map_err(control_error)?;
+        Ok(DefinitionTotals {
+            definition: totals.definition,
+            since_ms: totals.since_ms,
+            before_ms: totals.before_ms,
+            runs: totals.runs,
+            annotations: totals.annotations,
+        })
     }
 }
 fn definition(summary: api::DefinitionSummary) -> Result<Definition> {
@@ -534,6 +548,8 @@ fn definition(summary: api::DefinitionSummary) -> Result<Definition> {
             .map(|v| Version {
                 version: v.version.to_string(),
                 activated_ms: v.activated_ms,
+                activated_by: v.activated_by,
+                activation_note: v.activation_note,
             })
             .collect(),
         active: summary.active.map(|v| v.to_string()),
@@ -547,9 +563,50 @@ fn definition(summary: api::DefinitionSummary) -> Result<Definition> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use api::{ControlError as E, Entity};
 
     #[test]
-    fn storage_errors_preserve_the_source_chain_and_remain_internal() {
+    fn variants_map_to_console_errors() {
+        let id = || "x".to_owned();
+        let run = || (id(), id());
+        assert!(matches!(
+            control_error(E::NotFound {
+                entity: Entity::Run,
+                id: id()
+            }),
+            ControlError::NotFound(_)
+        ));
+        for conflict in [
+            E::RequestConflict { id: id() },
+            E::ResponseConflict { identity: id() },
+            E::InvalidState(id()),
+            E::WaitClosed {
+                run: run().0,
+                wait: run().1,
+            },
+            E::Stopped,
+        ] {
+            assert!(matches!(control_error(conflict), ControlError::Conflict(_)));
+        }
+        for invalid in [
+            E::InvalidInput(id()),
+            E::WaitMismatch {
+                run: run().0,
+                wait: run().1,
+            },
+        ] {
+            assert!(matches!(control_error(invalid), ControlError::Invalid(_)));
+        }
+        assert!(matches!(control_error(E::ReadOnly), ControlError::ReadOnly));
+    }
+
+    #[test]
+    fn schema_errors_are_unavailable_and_other_storage_errors_internal() {
+        let schema = anyhow::Error::new(ouro_durable::SchemaError::Unmigrated).context("opening");
+        assert!(matches!(
+            storage_error(schema),
+            ControlError::Unavailable(_)
+        ));
         let error = anyhow::Error::new(std::io::Error::other("underlying storage failure"))
             .context("db error")
             .context("reading definitions");

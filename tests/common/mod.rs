@@ -27,7 +27,47 @@ pub enum Backend {
         schemas: Arc<Mutex<Vec<String>>>,
     },
 }
+/// A new empty schema (nothing migrated) and the URL that selects it.
+async fn postgres_schema(url: &str, schemas: &Mutex<Vec<String>>) -> url::Url {
+    // Each fixture owns a schema; never truncate an existing runtime store.
+    let schema = format!("console_test_{}", uuid::Uuid::new_v4().simple());
+    let (admin, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
+        .await
+        .unwrap();
+    let task = tokio::spawn(async move {
+        connection.await.unwrap();
+    });
+    admin
+        .batch_execute(&format!("CREATE SCHEMA {schema}"))
+        .await
+        .unwrap();
+    drop(admin);
+    task.await.unwrap();
+    schemas.lock().unwrap().push(schema.clone());
+    let mut parsed = url::Url::parse(url).unwrap();
+    parsed
+        .query_pairs_mut()
+        .append_pair("options", &format!("-csearch_path={schema}"));
+    parsed
+}
 impl Backend {
+    /// A store spec nothing ever migrated (an empty database file, an empty
+    /// schema), for the read-only refusal. The directory keeps the file alive.
+    pub async fn unmigrated(&self) -> (String, Option<tempfile::TempDir>) {
+        match self {
+            Self::Fake => unreachable!("the fake has no store"),
+            Self::Sqlite => {
+                let dir = tempfile::tempdir().unwrap();
+                let path = dir.path().join("empty.sqlite");
+                rusqlite::Connection::open(&path).unwrap();
+                (format!("sqlite:{}", path.display()), Some(dir))
+            }
+            Self::Postgres { url, schemas } => {
+                let parsed = postgres_schema(url, schemas).await;
+                (format!("postgres:{parsed}"), None)
+            }
+        }
+    }
     pub fn postgres() -> Self {
         Self::Postgres {
             url: std::env::var("TEST_DATABASE_URL")
@@ -115,25 +155,7 @@ impl Fixture {
                 )
             }
             Backend::Postgres { url, schemas } => {
-                // Each fixture owns a schema; never truncate an existing runtime store.
-                let schema = format!("console_test_{}", uuid::Uuid::new_v4().simple());
-                let (admin, connection) = tokio_postgres::connect(url, tokio_postgres::NoTls)
-                    .await
-                    .unwrap();
-                let task = tokio::spawn(async move {
-                    connection.await.unwrap();
-                });
-                admin
-                    .batch_execute(&format!("CREATE SCHEMA {schema}"))
-                    .await
-                    .unwrap();
-                drop(admin);
-                task.await.unwrap();
-                schemas.lock().unwrap().push(schema.clone());
-                let mut parsed = url::Url::parse(url).unwrap();
-                parsed
-                    .query_pairs_mut()
-                    .append_pair("options", &format!("-csearch_path={schema}"));
+                let parsed = postgres_schema(url, schemas).await;
                 let spec = format!("postgres:{parsed}");
                 (
                     Arc::new(
@@ -233,7 +255,19 @@ impl Fixture {
             ),
         ] {
             let d = runtime.save(name, &yaml).await.unwrap();
-            runtime.activate(name, d.version).await.unwrap();
+            if d.version > 1 {
+                runtime
+                    .activate_as(
+                        name,
+                        d.version,
+                        "demo-operator",
+                        Some("promote after review"),
+                    )
+                    .await
+                    .unwrap();
+            } else {
+                runtime.activate(name, d.version).await.unwrap();
+            }
         }
         let stop = CancellationToken::new();
         for (id, name) in [

@@ -1,5 +1,5 @@
 //! rmcp's streamable HTTP transport is mounted by web::router at /mcp.
-use crate::client::{Command, ControlError, Cursor, Runs, Session, Waits};
+use crate::client::{Command, ControlError, Cursor, Runs, Session, Waits, totals_window};
 use rmcp::{
     ErrorData, ServerHandler,
     handler::server::{router::tool::ToolRouter, wrapper::Parameters},
@@ -73,6 +73,14 @@ pub struct ListPage {
 #[derive(Deserialize, JsonSchema)]
 pub struct DefinitionInput {
     pub definition: String,
+}
+#[derive(Deserialize, JsonSchema)]
+pub struct DefinitionTotalsInput {
+    pub definition: String,
+    /// Window start in epoch milliseconds; defaults to 24 hours before `before_ms`.
+    pub since_ms: Option<i64>,
+    /// Window end in epoch milliseconds; defaults to now.
+    pub before_ms: Option<i64>,
 }
 #[derive(Deserialize, JsonSchema)]
 pub struct RunInput {
@@ -227,6 +235,22 @@ impl Mcp {
                 .and_then(|d| {
                     d.ok_or_else(|| ControlError::NotFound("definition not found".into()))
                 }),
+        )
+    }
+    #[tool(
+        description = "Annotation totals (tokens, cost) summed over a definition's runs that ended in a window (default: the last 24 hours); ouro rounds the window out to whole hours.",
+        annotations(read_only_hint = true)
+    )]
+    async fn get_definition_totals(
+        &self,
+        Parameters(p): Parameters<DefinitionTotalsInput>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        let (since, before) = totals_window(p.since_ms, p.before_ms);
+        output(
+            self.session
+                .client
+                .totals(&p.definition, since, before)
+                .await,
         )
     }
     #[tool(

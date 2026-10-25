@@ -9,8 +9,7 @@ Postgres store. Web, MCP, and separate CLI processes address the same persistent
 state when configured with the same store. The console observes and controls
 runs; the embedding ouro host still admits and drives workflows.
 
-`ouro-runtime` and `ouro-durable` are pinned to Git revision `083d7dc`
-(`083d7dc4d0600a15e49b4da73a73fec46c4191d9`). `ows` types come through
+`ouro-runtime` and `ouro-durable` are pinned to the Git tag `v0.1.0`. `ows` types come through
 `ouro-runtime`'s reexport. `--fake` remains available for process-local demos.
 
 ## Run
@@ -53,10 +52,13 @@ secure tunnel. Database connections are separate from HTTP bearer protection.
 
 `--read-only` hides web actions, rejects HTTP/CLI commands, and exposes only MCP
 reads. `OuroControl` also refuses writes at its boundary. Read-only connections
-require an existing, initialized schema and bypass ouro's migrating constructors:
-SQLite opens with `SQLITE_OPEN_READ_ONLY` and deferred read transactions;
-Postgres uses serializable `READ ONLY` transactions. Neither transport issues
-DDL, row writes, or migrations. The shared ouro engine interprets the data.
+use ouro's own constructors, `sqlite::open_read_only` and
+`postgres::connect_read_only`: they never create, migrate or write, SQLite
+opens with `query_only` and deferred transactions, and Postgres uses serializable
+`READ ONLY` transactions. A database without the schema, or with another schema
+version, is refused with ouro's typed `SchemaError`; the console reports it as
+`ControlError::Unavailable` (HTTP 503 on pages, a message on the CLI and MCP).
+Open the store writable once, with the host's role, to migrate it.
 
 Use a **read-only database user** for real protection. For Postgres, grant only
 CONNECT, schema USAGE, and SELECT on `ouro_rows` and `ouro_migrations`, with no
@@ -77,10 +79,11 @@ workflows or heartbeat updates.
 
 | Route | Contents |
 | --- | --- |
-| `/runs` | Definition/state/age filters, admission or terminal history, cursor paging, 2-second htmx refresh, cancel links |
+| `/runs` | Definition/state/age filters, admission or terminal history, cursor paging, 2-second htmx refresh, a tokens column from the runs' own totals with the page's sum, cancel links |
 | `/runs/{id}` | State/version, lease holder and expiry, exact waits, usage (the run's annotation totals, `gen_ai.usage.input_tokens`/`output_tokens` first), call journal with delivery/states/annotations/arguments/results, jump budget, owned descendants including ended children, mailbox, pinned trace/span ids with the configured trace link, cancel/cancel tree |
 | `/pending` | What runs wait for, matcher/progress/correlation expectations, since time, absolute timeout, approve/reject or JSON data answers |
-| `/definitions` | Paged: versions, active version, epoch, fault count, automatic breaker/manual pause attribution and time, each schedule kind with next due time, overlap, catch-up and queued slot, pause/resume |
+| `/definitions` | Paged: versions with their latest activation time, actor and note, active version, epoch, fault count, automatic breaker/manual pause attribution and time, each schedule kind with next due time, overlap, catch-up and queued slot, pause/resume |
+| `/definitions/{name}` | Versions with activation attribution, and the summed annotations (tokens, cost) of the runs that ended in a window: last hour, 24 hours (default), 7 or 30 days |
 | `/workers` | Paged heartbeat rows: live/stale, last beat and expiry, runs held, application version, host, start |
 | `/journal` | Request ID, actor, reason, command, committed reply; optional `?run=…` |
 | `/emergency` | Always accessible from the red header control; current stop flag, confirmed stop/resume with required reason |
@@ -147,13 +150,16 @@ client. Set the bearer authorization header in your MCP client's transport
 configuration when a token is configured.
 
 Read tools: `list_runs`, `inspect_run`, `run_log`, `list_pending`,
-`list_definitions`, `get_definition`, `list_workers`. `list_definitions` and
-`list_workers` take `cursor` and `limit`; `get_definition` takes `definition`.
+`list_definitions`, `get_definition`, `get_definition_totals`, `list_workers`.
+`list_definitions` and `list_workers` take `cursor` and `limit`; `get_definition`
+takes `definition`. `get_definition_totals` takes `definition` and an optional
+window, `since_ms` and `before_ms` (default: the 24 hours before now), and returns
+the summed annotations (tokens, cost) of the runs that ended in it.
 
 Mutating tools: `respond`, `cancel_run`, `cancel_tree`, `pause_definition`,
 `resume_definition`, `stop_all`, `resume_all`. All require a nonempty `reason`;
 provide `request_id` for reliable retries. They return the request, command,
-timestamp, and reply as JSON. Read-only mode registers only the seven reads and
+timestamp, and reply as JSON. Read-only mode registers only the eight reads and
 refuses attempts to call writes. Inputs have generated JSON Schemas.
 
 `list_runs` accepts the run filters above (absolute milliseconds), `history`,
@@ -200,6 +206,7 @@ ouro-console run-log run-002
 ouro-console pending --event-type review.decision
 ouro-console definitions --limit 50
 ouro-console definition review
+ouro-console definition-totals review --since-ms 1800000000000 --before-ms 1800086400000
 ouro-console workers --limit 50
 ouro-console journal --run run-002
 ouro-console counts --definition review --limit 50
@@ -224,7 +231,6 @@ supports definition, run, event type, time bounds, and cursor. Counts supports
 - `src/client.rs`: console-owned DTOs, object-safe async `ControlClient`, shared
   authorization/attribution `Session`, errors.
 - `src/ouro.rs`: adapter from ouro's `Control` to the console's types, opaque cursor transport.
-- `src/readonly.rs`: non-migrating read-only database transports for ouro's transaction seam.
 - `src/fake.rs`: process-local fixtures, atomic state changes, query-bound
   continuations, audit and response identity deduplication.
 - `src/web.rs`: axum routes/middleware, Maud pages/forms, embedded assets.
@@ -251,8 +257,9 @@ annotation totals, and the trace/span IDs pinned at admission are projected
 from `Control::inspect`. No trace IDs or worker records are invented.
 Annotations are shown as ouro stores them: the GenAI token counts
 (`gen_ai.usage.input_tokens`, `gen_ai.usage.output_tokens`) are displayed
-first, every other name as a key/value. The runs list has no tokens column:
-saved runs carry no annotation totals, so it would take one inspection per row. Wait
+first, every other name as a key/value. `list` and `history` return each run's
+totals (ouro keeps them on the run row), so the runs list has a tokens column
+and its footer sums the page; the run page shows the same totals. Wait
 positions remain strings; strategies, matcher filters and incremental progress
 are displayed without evaluating expressions. Complex or wildcard responses
 can be submitted as complete CloudEvents through MCP/CLI. A response becomes
@@ -262,16 +269,24 @@ Cursors are URL-safe base64 wrappers around ouro's serialized opaque cursor.
 They are passed back unchanged to ouro, which enforces query binding. The
 console delegates transactional cancellation, pause/resume, emergency stop,
 response matching and identity, and attributed idempotent receipts to `Control`.
-It does not retry ambiguous writes. This pin exports operator validation errors
-as `anyhow` messages: known messages map to invalid/not-found/conflict errors;
-unknown storage failures remain internal errors. Storage error text includes the
-underlying cause chain, including Postgres's database diagnosis.
+It does not retry ambiguous writes. Failures are ouro's typed `ControlError`,
+mapped by variant and never by message: not found, a reused request or response
+identity, an invalid state, a closed wait and the emergency stop become
+`NotFound` / `Conflict` (404 / 409); a malformed request or a response that
+fails the wait's matcher is `Invalid` (400); read-only is `ReadOnly` (403); a
+`SchemaError` inside a storage failure is `Unavailable` (503); any other
+storage failure stays `Internal` (500) with its cause chain, including
+Postgres's database diagnosis.
 
 Definitions come from `Control::definitions` (bounded pages in binary name
 order, each page one transaction) and `Control::definition`. The console reads
-no store rows and knows no key layout; the only code below `Control` is the
-read-only transport, which exists because ouro's constructors migrate.
-`activated_ms` is shown when ouro records it (the current catalog does not).
+no store rows and knows no key layout. Each version shows its latest activation
+time and, when the host attributed it, who activated it and the note. A
+definition's page (`/definitions/<name>`) shows the versions and
+`Control::totals`: the summed annotations of the runs that ended in a window
+(last hour, 24 hours by default, 7 or 30 days), in a plain table. The same
+totals are in MCP (`get_definition_totals`) and the CLI
+(`definition-totals <name> [--since-ms N] [--before-ms N]`).
 Workers come from `Control::workers`: one heartbeat row per worker, stale when
 it did not beat again before its expiry by ouro's clock. Process memory and
 CPU are not in the rows; ouro leaves them to an outside process exporter.
@@ -312,7 +327,8 @@ use ouro's `Runtime` to save/activate definitions, admit and drive workflows
 admitted inside a known span context), create owned children, pause a
 definition, cancel a run, and write heartbeat rows from two runtimes, one of
 them stale. A persisted lease provides a running view. Tests also cover independent-process CLI selection,
-opaque paging, mapping/error behavior, read-only non-migration, and HTTP actions
+opaque paging, typed error mapping, read-only refusal of an unmigrated or newer
+store, run and definition totals, activation attribution, and HTTP actions
 observed through ouro's API, including driving a responded wait to completion.
 
 Postgres variants are ignored by default. With a disposable test database whose

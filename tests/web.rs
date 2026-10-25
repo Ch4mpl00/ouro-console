@@ -10,6 +10,7 @@ use ouro_console::{
     client::*,
     web::{WebConfig, router},
 };
+use serde_json::json;
 use tower::ServiceExt;
 
 async fn setup(read_only: bool, backend: &Backend) -> (Router, Fixture) {
@@ -257,7 +258,7 @@ async fn filters_paging_and_polling_preserve_query(backend: Backend) {
             .expect("next page link")
             .replace("&amp;", "&")
     };
-    let title = |name: &str| format!("<h2 class=\"card-title\">{name}</h2>");
+    let title = |name: &str| format!("<a href=\"/definitions/{name}\">{name}</a>");
     let (_, first) = request(&app, "GET", "/definitions?limit=3", "", &[]).await;
     assert!(first.contains(&title("archive")) && !first.contains(&title("transform")));
     let (code, rest) = request(&app, "GET", &follow(&first), "", &[]).await;
@@ -591,7 +592,57 @@ async fn embedded_assets_and_trace_configuration_are_valid(backend: Backend) {
     }
 }
 
+async fn runs_show_tokens_and_the_definition_page_shows_versions_and_totals(backend: Backend) {
+    let (app, fixture) = setup(false, &backend).await;
+    fixture
+        .respond(
+            &Request {
+                id: "answer".into(),
+                actor: "tests".into(),
+                reason: "finish a run".into(),
+            },
+            "run-003",
+            &fixture.wait_key,
+            json!({"specversion":"1.0","source":"tests","id":"answer","type":"review.decision","data":{"decision":"approve"}}),
+        )
+        .await
+        .unwrap();
+    fixture.drive_answer().await;
+    let (code, runs) = request(&app, "GET", "/runs?history=true&limit=100", "", &[]).await;
+    assert_eq!(code, StatusCode::OK, "{runs}");
+    assert!(runs.contains("<th>Tokens</th>"), "{runs}");
+    assert!(runs.contains(" in / ") && runs.contains(" out"), "{runs}");
+    assert!(runs.contains(" tokens on this page"), "{runs}");
+    let (code, page) = request(&app, "GET", "/definitions/review", "", &[]).await;
+    assert_eq!(code, StatusCode::OK, "{page}");
+    for wanted in [
+        "Versions",
+        "activated",
+        "by demo-operator",
+        "promote after review",
+        "Last 24 hours",
+        "gen_ai.usage.input_tokens",
+        "gen_ai.usage.output_tokens",
+    ] {
+        assert!(page.contains(wanted), "{wanted}: {page}");
+    }
+    let (code, _) = request(&app, "GET", "/definitions/review?hours=1", "", &[]).await;
+    assert_eq!(code, StatusCode::OK);
+    assert_eq!(
+        request(&app, "GET", "/definitions/review?hours=0", "", &[])
+            .await
+            .0,
+        StatusCode::BAD_REQUEST
+    );
+    assert_eq!(
+        request(&app, "GET", "/definitions/missing", "", &[])
+            .await
+            .0,
+        StatusCode::NOT_FOUND
+    );
+}
 common::backend_tests!(
+    runs_show_tokens_and_the_definition_page_shows_versions_and_totals,
     every_page_renders_key_content_and_global_controls,
     filters_paging_and_polling_preserve_query,
     each_action_mutates_and_returns_attributed_receipt,

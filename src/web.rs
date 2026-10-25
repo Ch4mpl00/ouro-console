@@ -15,7 +15,11 @@ use rmcp::transport::streamable_http_server::{
 use rust_embed::RustEmbed;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::{collections::BTreeSet, net::SocketAddr, sync::Arc};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    net::SocketAddr,
+    sync::Arc,
+};
 use subtle::ConstantTimeEq;
 
 #[derive(RustEmbed)]
@@ -80,6 +84,7 @@ pub fn router(session: Session, config: WebConfig) -> Router {
         .route("/runs/{id}", get(detail))
         .route("/pending", get(pending))
         .route("/definitions", get(definitions))
+        .route("/definitions/{name}", get(definition_page))
         .route("/workers", get(workers))
         .route("/journal", get(journal))
         .route("/emergency", get(emergency))
@@ -159,6 +164,7 @@ impl IntoResponse for ControlError {
             Self::NotFound(_) => StatusCode::NOT_FOUND,
             Self::Conflict(_) => StatusCode::CONFLICT,
             Self::ReadOnly => StatusCode::FORBIDDEN,
+            Self::Unavailable(_) => StatusCode::SERVICE_UNAVAILABLE,
             Self::Internal(_) => StatusCode::INTERNAL_SERVER_ERROR,
         };
         (code,html! { main class="container py-5" { h1 { "Request failed" } p { (self.to_string()) } a href="/runs" { "Back to runs" } } }).into_response()
@@ -356,16 +362,17 @@ async fn runs(
     let poll_url = query.url();
     let panel = html! { section id="runs-panel" class="card" hx-get=(poll_url) hx-trigger="every 2s" hx-swap="outerHTML" {
         div class="card-header" { h2 class="card-title" { (if query.history { "Terminal history" } else { "Run activity" }) } span class="ms-auto text-secondary small" { (icon("refresh")) " Live · 2s" } }
-        div class="table-responsive" { table class="table table-vcenter card-table" { thead { tr { th { "Run / definition" } th { "State" } th { "Version" } th { "Admitted" } th { "Parent" } @if !app.session.read_only { th { "Action" } } } }
+        div class="table-responsive" { table class="table table-vcenter card-table" { thead { tr { th { "Run / definition" } th { "State" } th { "Version" } th { "Admitted" } th { "Tokens" } th { "Parent" } @if !app.session.read_only { th { "Action" } } } }
             tbody { @for run in &page.items { tr {
                 td { a class="fw-semibold" href=(format!("/runs/{}",run.id)) { (run.id) } div class="text-secondary small" { (run.definition) } }
                 td { (badge(run.state)) } td { code { (run.version) } } td title=(time(run.admitted_ms)) { (age(run.admitted_ms)) }
+                td { (run_tokens(&run.annotations)) }
                 td { @if let Some(parent) = &run.parent { a href=(format!("/runs/{parent}")) { (parent) } } @else { "—" } }
                 @if !app.session.read_only { td { @if !run.state.terminal() { a class="btn btn-sm btn-outline-danger" href=(format!("/runs/{}#actions",run.id)) { "Cancel" } } } }
             } }
-            @if page.items.is_empty() { tr { td colspan="6" class="text-secondary p-4" { "No matching runs in this page." @if page.next.is_some() { " More candidates are available; continue to the next page." } } } }
+            @if page.items.is_empty() { tr { td colspan=(if app.session.read_only { 6 } else { 7 }) class="text-secondary p-4" { "No matching runs in this page." @if page.next.is_some() { " More candidates are available; continue to the next page." } } } }
         } } }
-        div class="card-footer d-flex align-items-center" { span class="text-secondary small" { (page.items.len()) " matches · bounded page" }
+        div class="card-footer d-flex align-items-center" { span class="text-secondary small" { (page.items.len()) " matches · bounded page" @if let Some(sum) = page_tokens(&page.items) { " · " (sum) " on this page" } }
             div class="ms-auto btn-list" { @if query.cursor.is_some() { @let mut first = query.clone(); @let _ = first.cursor.take(); a class="btn btn-sm" href=(first.url()) { "First page" } }
                 @if let Some(next) = page.next { @let mut q = query.clone(); @let _ = q.cursor.replace(next); a class="btn btn-sm btn-primary" href=(q.url()) { "Next page " (icon("arrow-right")) } }
             }
@@ -500,6 +507,37 @@ fn annotations(items: &[(&str, String)], large: bool) -> Markup {
         dl class="annotation-list row mb-0 small" { @for (k, v) in rest { dt class="col-sm-5 fw-normal" { code { (k) } } dd class="col-sm-7 mb-1" { (v) } } }
     }
 }
+/// A token count recorded under a GenAI name, when it is an integer.
+fn count(totals: &BTreeMap<String, serde_json::Number>, name: &str) -> Option<i64> {
+    totals.get(name).and_then(serde_json::Number::as_i64)
+}
+/// "input in / output out" for a run's totals, or a dash when it recorded none.
+fn run_tokens(totals: &BTreeMap<String, serde_json::Number>) -> Markup {
+    let (input, output) = (count(totals, INPUT_TOKENS), count(totals, OUTPUT_TOKENS));
+    html! { @if input.is_none() && output.is_none() { span class="text-secondary" { "—" } }
+    @else { span title=(format!("{INPUT_TOKENS} / {OUTPUT_TOKENS}")) { (input.unwrap_or(0)) " in / " (output.unwrap_or(0)) " out" } } }
+}
+/// The page's tokens summed from the runs' own totals, when any run has them.
+fn page_tokens(runs: &[SavedRun]) -> Option<String> {
+    let sum = |name: &str| {
+        runs.iter()
+            .filter_map(|r| count(&r.annotations, name))
+            .sum::<i64>()
+    };
+    runs.iter()
+        .any(|r| {
+            count(&r.annotations, INPUT_TOKENS)
+                .or(count(&r.annotations, OUTPUT_TOKENS))
+                .is_some()
+        })
+        .then(|| {
+            format!(
+                "{} in / {} out tokens",
+                sum(INPUT_TOKENS),
+                sum(OUTPUT_TOKENS)
+            )
+        })
+}
 fn wait_info(w: &PendingWait) -> Markup {
     html! {
         p { strong { (w.types.join(", ")) } " · " (w.strategy) " · since " span title=(time(w.since_ms)) { (age(w.since_ms)) } }
@@ -564,6 +602,48 @@ fn schedule_info(s: &Schedule, paused: bool) -> Markup {
             @if let Some(q) = &s.queued { " · queued slot " a href=(format!("/runs/{}",q.run)) { (q.run) } " (version " (q.version) ")" } }
     } }
 }
+/// One version with its latest activation: when, and by whom and why if the host said.
+fn version_info(v: &Version) -> Markup {
+    html! { div { code { (v.version) } " · "
+        @match v.activated_ms { Some(at) => { "activated " span title=(time(at)) { (time(at)) } }, None => { span class="text-secondary" { "never activated" } } }
+        @if let Some(by) = &v.activated_by { " by " (by) }
+        @if let Some(note) = &v.activation_note { span class="text-secondary" { " · " (note) } }
+    } }
+}
+#[derive(Deserialize)]
+struct TotalsQuery {
+    hours: Option<i64>,
+}
+async fn definition_page(
+    State(app): State<App>,
+    Path(name): Path<String>,
+    Query(q): Query<TotalsQuery>,
+) -> Result<Markup> {
+    let hours = q.hours.unwrap_or(24);
+    if !(1..=720).contains(&hours) {
+        return Err(ControlError::Invalid("hours must be 1..=720".into()));
+    }
+    let d = app
+        .session
+        .client
+        .definition(&name)
+        .await?
+        .ok_or_else(|| ControlError::NotFound("definition not found".into()))?;
+    let (since, before) = totals_window(hours.checked_mul(3_600_000).map(|ms| now_ms() - ms), None);
+    let totals = app.session.client.totals(&name, since, before).await?;
+    layout(&app,&format!("Definition {name}"),"Versions and the usage of runs that ended in a window.",html! {
+        section class="card mb-4" { div class="card-header" { h2 class="card-title" { "Versions" } span class="badge bg-secondary-lt ms-auto" { "active " (d.active.as_deref().unwrap_or("none")) } }
+            div class="card-body" { @for v in &d.versions { (version_info(v)) } } }
+        section id="totals" class="card" { div class="card-header" { h2 class="card-title" { "Totals" }
+            form method="get" class="ms-auto" { select class="form-select" name="hours" aria-label="Window" { @for (n, label) in [(1, "Last hour"), (24, "Last 24 hours"), (168, "Last 7 days"), (720, "Last 30 days")] { option value=(n) selected[hours == n] { (label) } } } button class="btn mt-2" type="submit" { "Show" } } }
+            div class="card-body" {
+                p class="text-secondary" { (totals.runs) " runs ended with annotation totals, " span title=(time(totals.since_ms)) { (time(totals.since_ms)) } " to " span title=(time(totals.before_ms)) { (time(totals.before_ms)) } " (ouro rounds the window out to whole hours)." }
+                @if totals.annotations.is_empty() { p class="text-secondary mb-0" { "No numeric annotations recorded in this window" } }
+                @else { table class="table card-table" { thead { tr { th { "Annotation" } th { "Total" } } }
+                    tbody { @for (k, v) in &totals.annotations { tr { td { code { (k) } } td { (v) } } } } } }
+            } }
+    }).await
+}
 async fn definitions(State(app): State<App>, Query(q): Query<PageQuery>) -> Result<Markup> {
     let page = app
         .session
@@ -571,10 +651,10 @@ async fn definitions(State(app): State<App>, Query(q): Query<PageQuery>) -> Resu
         .definitions(q.cursor.as_ref(), q.limit.unwrap_or(50))
         .await?;
     layout(&app,"Definitions","Versions, admission breakers, and schedules. Existing work finishes during a manual pause.",html! {
-        div class="row g-4" { @for d in &page.items { div class="col-lg-6" { section class="card h-100" { div class="card-header" { h2 class="card-title" { (d.name) } span class="badge bg-secondary-lt ms-auto" { "epoch " (d.epoch) } }
+        div class="row g-4" { @for d in &page.items { div class="col-lg-6" { section class="card h-100" { div class="card-header" { h2 class="card-title" { a href=(format!("/definitions/{}", d.name)) { (d.name) } } span class="badge bg-secondary-lt ms-auto" { "epoch " (d.epoch) } }
             div class="card-body" {
                 dl class="row" { dt class="col-sm-4" { "Active version" } dd class="col-sm-8" { code { (d.active.as_deref().unwrap_or("none")) } }
-                    dt class="col-sm-4" { "Versions" } dd class="col-sm-8" { @for (n, v) in d.versions.iter().enumerate() { @if n > 0 { ", " } span title=(v.activated_ms.map(time).unwrap_or_else(|| "activation time not recorded".into())) { (v.version) } } }
+                    dt class="col-sm-4" { "Versions" } dd class="col-sm-8" { @for v in &d.versions { (version_info(v)) } }
                     dt class="col-sm-4" { "Schedule" } dd class="col-sm-8" { @if d.schedules.is_empty() { "No schedule" } @for s in &d.schedules { (schedule_info(s, matches!(d.tripped, Some(Trip::Manual { .. })))) } }
                     dt class="col-sm-4" { "Breaker" } dd class="col-sm-8" { @match &d.tripped {
                         None => { span class="badge bg-green-lt" { "healthy" } " · " (d.faults) " consecutive faults" },

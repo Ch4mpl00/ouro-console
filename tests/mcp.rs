@@ -82,6 +82,7 @@ async fn streamable_http_initializes_and_lists_all_schemas(backend: Backend) {
             "respond",
             "list_definitions",
             "get_definition",
+            "get_definition_totals",
             "list_workers",
             "cancel_run",
             "cancel_tree",
@@ -281,7 +282,7 @@ async fn read_only_mcp_exposes_and_accepts_only_reads(backend: Backend) {
     let (app, fixture) = setup(true, &backend).await;
     let list = rpc(&app, "tools/list", json!({})).await;
     let tools = list["result"]["tools"].as_array().unwrap();
-    assert_eq!(tools.len(), 7);
+    assert_eq!(tools.len(), 8);
     for name in WRITES {
         assert!(!tools.iter().any(|t| t["name"] == name));
         let reply = call(&app, name, json!({"reason":"attempt"})).await;
@@ -291,6 +292,24 @@ async fn read_only_mcp_exposes_and_accepts_only_reads(backend: Backend) {
         );
     }
     assert!(!fixture.stopped().await.unwrap());
+    let totals = call(
+        &app,
+        "get_definition_totals",
+        json!({"definition":"review"}),
+    )
+    .await;
+    assert_ne!(totals["result"]["isError"], true, "{totals}");
+    let window: Value =
+        serde_json::from_str(totals["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(window["definition"], "review", "{totals}");
+    assert!(window["annotations"].is_object(), "{totals}");
+    let inverted = call(
+        &app,
+        "get_definition_totals",
+        json!({"definition":"review","since_ms":10,"before_ms":5}),
+    )
+    .await;
+    assert_eq!(inverted["result"]["isError"], true, "{inverted}");
     assert_eq!(
         call(&app, "get_definition", json!({"definition":"missing"})).await["result"]["isError"],
         true
@@ -300,7 +319,7 @@ async fn read_only_mcp_exposes_and_accepts_only_reads(backend: Backend) {
         actor: "observer".into(),
         read_only: true,
     });
-    assert_eq!(info.tools().len(), 7);
+    assert_eq!(info.tools().len(), 8);
 }
 
 common::backend_tests!(

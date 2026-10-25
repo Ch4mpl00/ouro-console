@@ -441,6 +441,34 @@ async fn opaque_paging_mappings_and_error_classification(backend: Backend) {
         Err(ControlError::Invalid(_))
     ));
     assert!(fixture.entry("conflict").await.unwrap().is_none());
+    assert!(matches!(
+        fixture
+            .respond(
+                &Request {
+                    id: "unknown-run".into(),
+                    ..request.clone()
+                },
+                "missing-run",
+                &fixture.wait_key,
+                json!({"source":"tests","id":"nobody","type":"review.decision"})
+            )
+            .await,
+        Err(ControlError::NotFound(_))
+    ));
+    assert!(matches!(
+        fixture
+            .respond(
+                &Request {
+                    id: "unopened".into(),
+                    ..request.clone()
+                },
+                "run-003",
+                "/not-a-wait",
+                json!({"source":"tests","id":"unopened","type":"review.decision"})
+            )
+            .await,
+        Err(ControlError::Conflict(_))
+    ));
     fixture.emergency_stop(&request, true).await.unwrap();
     assert!(matches!(
         fixture.emergency_stop(&request, false).await,
@@ -657,6 +685,138 @@ async fn sqlite_opaque_paging_mappings_and_error_classification() {
 async fn sqlite_read_only_connection_reads_without_mutating_or_migrating() {
     read_only_connection_reads_without_mutating_or_migrating(Backend::Sqlite).await;
 }
+async fn read_only_refuses_an_unmigrated_store_with_a_schema_error(backend: Backend) {
+    let (spec, _keep) = backend.unmigrated().await;
+    let error = match OuroControl::connect(&spec, true).await {
+        Ok(_) => panic!("an unmigrated store must be refused"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(&error, ControlError::Unavailable(m) if m.contains("no schema")),
+        "{error}"
+    );
+    // The refusal changed nothing: the same store still migrates writable.
+    OuroControl::connect(&spec, false).await.unwrap();
+    OuroControl::connect(&spec, true).await.unwrap();
+}
+#[tokio::test]
+async fn sqlite_read_only_refuses_an_unmigrated_store_with_a_schema_error() {
+    read_only_refuses_an_unmigrated_store_with_a_schema_error(Backend::Sqlite).await;
+}
+#[tokio::test]
+async fn read_only_refuses_a_newer_schema_version() {
+    let fixture = Fixture::new(&Backend::Sqlite).await;
+    let spec = fixture.spec.as_deref().unwrap();
+    let path = spec.strip_prefix("sqlite:").unwrap();
+    rusqlite::Connection::open(path)
+        .unwrap()
+        .execute_batch("PRAGMA user_version = 999")
+        .unwrap();
+    for read_only in [true, false] {
+        let error = match OuroControl::connect(spec, read_only).await {
+            Ok(_) => panic!("a newer schema must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, ControlError::Unavailable(m) if m.contains("999")),
+            "{error}"
+        );
+    }
+}
+async fn definition_totals_run_totals_and_activations_come_from_ouro(backend: Backend) {
+    let fixture = Fixture::new(&backend).await;
+    let hour = 3_600_000;
+    let (since, before) = (now_ms() - 2 * hour, now_ms() + hour);
+    if fixture.is_real() {
+        // Nothing with totals has ended in the window yet.
+        let totals = fixture.totals("review", since, before).await.unwrap();
+        assert_eq!((totals.runs, totals.annotations.len()), (0, 0));
+    }
+    fixture
+        .respond(
+            &Request {
+                id: "finish".into(),
+                actor: "tests".into(),
+                reason: "finish a run".into(),
+            },
+            "run-003",
+            &fixture.wait_key,
+            json!({"specversion":"1.0","source":"tests","id":"finish","type":"review.decision"}),
+        )
+        .await
+        .unwrap();
+    fixture.drive_answer().await;
+    let totals = fixture.totals("review", since, before).await.unwrap();
+    assert_eq!(totals.definition, "review");
+    assert!(totals.runs >= 1);
+    assert!(totals.annotations.contains_key("gen_ai.usage.input_tokens"));
+    if fixture.is_real() {
+        assert_eq!(totals.runs, 1);
+        assert_eq!(
+            totals.annotations["gen_ai.usage.input_tokens"],
+            common::INPUT_TOKENS.into()
+        );
+        assert_eq!(
+            totals.annotations["gen_ai.usage.output_tokens"],
+            common::OUTPUT_TOKENS.into()
+        );
+    }
+    assert!(matches!(
+        fixture.totals("review", before, since).await,
+        Err(ControlError::Invalid(_))
+    ));
+    // The ended run's own totals ride the listings.
+    let ended = Runs {
+        definition: Some("review".into()),
+        since_ms: Some(since),
+        before_ms: Some(before),
+        ..Default::default()
+    };
+    let history = fixture.history(&ended, None, 100).await.unwrap();
+    assert!(history.items.iter().any(|r| {
+        r.annotations
+            .get("gen_ai.usage.input_tokens")
+            .is_some_and(|n| n.as_i64().is_some_and(|n| n > 0))
+    }));
+    if fixture.is_real() {
+        let run = history.items.iter().find(|r| r.id == "run-003").unwrap();
+        assert_eq!(
+            run.annotations["gen_ai.usage.input_tokens"],
+            common::INPUT_TOKENS.into()
+        );
+        let inspected = fixture.inspect("run-003").await.unwrap().unwrap();
+        assert_eq!(inspected.run.annotations, inspected.annotations);
+        // A run that never ended carries no totals.
+        let listed = fixture.list(&ended, None, 100).await.unwrap();
+        assert!(
+            listed
+                .items
+                .iter()
+                .any(|r| r.id == "run-001" && r.annotations.is_empty())
+        );
+    }
+    // The latest activation of each version, with its attribution.
+    let review = fixture.definition("review").await.unwrap().unwrap();
+    assert_eq!(review.versions.len(), 2);
+    assert!(review.versions.iter().all(|v| v.activated_ms.is_some()));
+    assert_eq!(review.versions[0].activated_by, None);
+    assert_eq!(
+        review.versions[1].activated_by.as_deref(),
+        Some("demo-operator")
+    );
+    assert_eq!(
+        review.versions[1].activation_note.as_deref(),
+        Some("promote after review")
+    );
+}
+#[tokio::test]
+async fn sqlite_definition_totals_run_totals_and_activations_come_from_ouro() {
+    definition_totals_run_totals_and_activations_come_from_ouro(Backend::Sqlite).await;
+}
+#[tokio::test]
+async fn fake_definition_totals_run_totals_and_activations_follow_the_same_contract() {
+    definition_totals_run_totals_and_activations_come_from_ouro(Backend::Fake).await;
+}
 #[tokio::test]
 async fn read_only_never_creates_a_missing_database_or_initializes_a_schema() {
     let dir = tempfile::tempdir().unwrap();
@@ -664,15 +824,6 @@ async fn read_only_never_creates_a_missing_database_or_initializes_a_schema() {
     let spec = format!("sqlite:{}", path.display());
     assert!(OuroControl::connect(&spec, true).await.is_err());
     assert!(!path.exists());
-    let empty = dir.path().join("empty.sqlite");
-    rusqlite::Connection::open(&empty).unwrap();
-    let before = std::fs::read(&empty).unwrap();
-    assert!(
-        OuroControl::connect(&format!("sqlite:{}", empty.display()), true)
-            .await
-            .is_err()
-    );
-    assert_eq!(std::fs::read(&empty).unwrap(), before);
 }
 #[tokio::test]
 async fn cli_processes_select_a_persistent_store_and_environment() {
@@ -741,6 +892,8 @@ async fn postgres_real_store_contract_and_http_end_to_end() {
     read_only_connection_reads_without_mutating_or_migrating(backend.clone()).await;
     complex_wait_progress_and_response_replay_are_owned_by_ouro(backend.clone()).await;
     definition_catalog_spans_pages_in_both_access_modes(backend.clone()).await;
+    read_only_refuses_an_unmigrated_store_with_a_schema_error(backend.clone()).await;
+    definition_totals_run_totals_and_activations_come_from_ouro(backend.clone()).await;
     backend.cleanup().await;
 }
 

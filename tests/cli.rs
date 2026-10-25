@@ -33,6 +33,15 @@ fn every_script_command_parses_and_mutations_require_reason() {
         vec!["definitions"],
         vec!["definitions", "--limit", "10", "--cursor", "opaque"],
         vec!["definition", "review"],
+        vec!["definition-totals", "review"],
+        vec![
+            "definition-totals",
+            "review",
+            "--since-ms",
+            "1",
+            "--before-ms",
+            "3600000",
+        ],
         vec!["workers"],
         vec!["workers", "--limit", "5"],
         vec!["journal", "--run", "run-002"],
@@ -121,6 +130,26 @@ async fn script_dispatch_uses_shared_client_and_read_only_policy(backend: Backen
         .unwrap();
     assert_eq!(definition["tripped"]["kind"], "manual");
     assert_eq!(definition["schedules"][0]["kind"], "every");
+    let totals = cli::execute(&session, parse(vec!["definition-totals", "review"]))
+        .await
+        .unwrap();
+    assert_eq!(totals["definition"], "review");
+    assert!(totals["annotations"].is_object());
+    assert!(matches!(
+        cli::execute(
+            &session,
+            parse(vec![
+                "definition-totals",
+                "review",
+                "--since-ms",
+                "9",
+                "--before-ms",
+                "3"
+            ])
+        )
+        .await,
+        Err(ControlError::Invalid(_))
+    ));
     assert!(matches!(
         cli::execute(&session, parse(vec!["definition", "missing"])).await,
         Err(ControlError::NotFound(_))

@@ -61,6 +61,15 @@ pub enum Action {
     Definition {
         name: String,
     },
+    /// Annotation totals (tokens, cost) of a definition's runs that ended in
+    /// a window; the last 24 hours by default.
+    DefinitionTotals {
+        name: String,
+        #[arg(long)]
+        since_ms: Option<i64>,
+        #[arg(long)]
+        before_ms: Option<i64>,
+    },
     Workers(PageArgs),
     Journal {
         #[arg(long)]
@@ -328,6 +337,14 @@ pub async fn execute(session: &Session, action: Action) -> Result<Value> {
                     .await?
                     .ok_or_else(|| ControlError::NotFound("definition not found".into()))?,
             );
+        }
+        Action::DefinitionTotals {
+            name,
+            since_ms,
+            before_ms,
+        } => {
+            let (since, before) = totals_window(since_ms, before_ms);
+            return json(c.totals(&name, since, before).await?);
         }
         Action::Workers(p) => {
             return json(c.workers(p.cursor.map(Cursor).as_ref(), p.limit).await?);

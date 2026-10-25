@@ -17,6 +17,10 @@ pub enum ControlError {
     Conflict(String),
     #[error("read-only mode: commands are disabled")]
     ReadOnly,
+    /// The store cannot be read by this build: no schema yet, or another
+    /// schema version (ouro's `SchemaError`).
+    #[error("{0}")]
+    Unavailable(String),
     #[error("{0}")]
     Internal(String),
 }
@@ -157,6 +161,10 @@ pub struct SavedRun {
     pub ended_ms: Option<i64>,
     pub parent: Option<String>,
     pub error: Option<Value>,
+    /// The run's numeric call annotations summed per name (its tokens), as
+    /// ouro keeps them on the run row.
+    #[serde(default)]
+    pub annotations: BTreeMap<String, serde_json::Number>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lease {
@@ -233,8 +241,22 @@ pub enum Trip {
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Version {
     pub version: String,
-    /// None when the catalog did not record the activation instant.
+    /// None when the version was never activated.
     pub activated_ms: Option<i64>,
+    /// Who activated it and why, when the host said.
+    pub activated_by: Option<String>,
+    pub activation_note: Option<String>,
+}
+/// One definition's annotation totals over a window of ended runs. The
+/// window is rounded out to whole hours by ouro.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct DefinitionTotals {
+    pub definition: String,
+    pub since_ms: i64,
+    pub before_ms: i64,
+    /// The runs that ended in the window with annotation totals.
+    pub runs: u64,
+    pub annotations: BTreeMap<String, serde_json::Number>,
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct QueuedSlot {
@@ -317,6 +339,14 @@ pub trait ControlClient: Send + Sync {
     async fn definitions(&self, cursor: Option<&Cursor>, limit: usize) -> Result<Page<Definition>>;
     async fn definition(&self, name: &str) -> Result<Option<Definition>>;
     async fn workers(&self, cursor: Option<&Cursor>, limit: usize) -> Result<Page<Worker>>;
+    /// Annotation totals of the definition's runs that ended in
+    /// `[since_ms, before_ms)`.
+    async fn totals(
+        &self,
+        definition: &str,
+        since_ms: i64,
+        before_ms: i64,
+    ) -> Result<DefinitionTotals>;
     async fn cancel(&self, request: &Request, run: &str) -> Result<Reply> {
         self.execute(request, &Command::Cancel { run: run.into() })
             .await
@@ -396,6 +426,12 @@ impl Session {
             reply,
         }))
     }
+}
+/// A totals window defaults to the 24 hours before `before_ms` (now).
+pub const TOTALS_WINDOW_MS: i64 = 86_400_000;
+pub fn totals_window(since_ms: Option<i64>, before_ms: Option<i64>) -> (i64, i64) {
+    let before = before_ms.unwrap_or_else(now_ms);
+    (since_ms.unwrap_or(before - TOTALS_WINDOW_MS), before)
 }
 pub fn now_ms() -> i64 {
     chrono::Utc::now().timestamp_millis()
