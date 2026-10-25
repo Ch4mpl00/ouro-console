@@ -51,6 +51,7 @@ impl FakeControl {
                         error: (state == RunState::Failed).then(
                             || json!({"type":"timeout","detail":"upstream deadline exceeded"}),
                         ),
+                        annotations: usage(),
                     },
                     lease: (state == RunState::Running).then(|| Lease {
                         holder: "worker-a".into(),
@@ -85,14 +86,7 @@ impl FakeControl {
                             },
                         })
                         .collect(),
-                    annotations: BTreeMap::from([
-                        ("gen_ai.usage.input_tokens".into(), 1200.into()),
-                        ("gen_ai.usage.output_tokens".into(), 340.into()),
-                        (
-                            "cost_usd".into(),
-                            serde_json::Number::from_f64(0.012).expect("finite"),
-                        ),
-                    ]),
+                    annotations: usage(),
                     children: vec![],
                     budget_spent: 7,
                     budget_limit: Some(100),
@@ -131,6 +125,7 @@ impl FakeControl {
             child.lease = None;
             child.calls.clear();
             child.annotations.clear();
+            child.run.annotations.clear();
             if state == RunState::Waiting {
                 child.waits.insert(
                     "/signal".into(),
@@ -154,6 +149,8 @@ impl FakeControl {
                 .map(|v| Version {
                     version: format!("v{v}"),
                     activated_ms: Some(now - 86_400_000 / i64::try_from(v).unwrap_or(1)),
+                    activated_by: (v > 1).then(|| "demo-operator".into()),
+                    activation_note: (v > 1).then(|| "promote after review".into()),
                 })
                 .collect::<Vec<_>>()
         };
@@ -325,6 +322,26 @@ impl FakeControl {
             .retain(|r| filter.state.is_none_or(|s| s == r.state));
         Ok(page)
     }
+}
+/// What the demo's calls summed to, on the run row and in the inspection.
+fn usage() -> BTreeMap<String, serde_json::Number> {
+    BTreeMap::from([
+        ("gen_ai.usage.input_tokens".into(), 1200.into()),
+        ("gen_ai.usage.output_tokens".into(), 340.into()),
+        (
+            "cost_usd".into(),
+            serde_json::Number::from_f64(0.012).expect("finite"),
+        ),
+    ])
+}
+/// `a + b`: integers stay integers while the sum fits, as ouro's totals do.
+fn add(a: &serde_json::Number, b: &serde_json::Number) -> serde_json::Number {
+    a.as_i64()
+        .zip(b.as_i64())
+        .and_then(|(x, y)| x.checked_add(y))
+        .map(serde_json::Number::from)
+        .or_else(|| serde_json::Number::from_f64(a.as_f64()? + b.as_f64()?))
+        .unwrap_or_else(|| a.clone())
 }
 #[derive(Serialize, Deserialize)]
 struct Position {
@@ -667,6 +684,39 @@ impl ControlClient for FakeControl {
             .iter()
             .find(|d| d.name == name)
             .cloned())
+    }
+    async fn totals(
+        &self,
+        definition: &str,
+        since_ms: i64,
+        before_ms: i64,
+    ) -> Result<DefinitionTotals> {
+        window(Some(since_ms), Some(before_ms))?;
+        let data = self.data()?;
+        let mut totals = DefinitionTotals {
+            definition: definition.into(),
+            since_ms,
+            before_ms,
+            runs: 0,
+            annotations: BTreeMap::new(),
+        };
+        let ended = data.runs.values().map(|i| &i.run).filter(|r| {
+            r.definition == definition
+                && !r.annotations.is_empty()
+                && r.ended_ms
+                    .is_some_and(|t| in_window(t, Some(since_ms), Some(before_ms)))
+        });
+        for run in ended {
+            totals.runs += 1;
+            for (name, n) in &run.annotations {
+                let sum = totals
+                    .annotations
+                    .get(name)
+                    .map_or(n.clone(), |t| add(t, n));
+                totals.annotations.insert(name.clone(), sum);
+            }
+        }
+        Ok(totals)
     }
     async fn workers(&self, cursor: Option<&Cursor>, limit: usize) -> Result<Page<Worker>> {
         let data = self.data()?;

@@ -7,10 +7,8 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", rev = "083d7dc" }
-ouro-durable = { git = "https://github.com/Ch4mpl00/ouro", rev = "083d7dc" }
-rusqlite = { version = "0.40.2", features = ["bundled"] }
-tokio-postgres = "0.7.18"
+ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.1.0" }
+ouro-durable = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.1.0" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["form", "query"] }
 base64 = "0.22"
@@ -30,6 +28,8 @@ url = "2"
 uuid = { version = "1", features = ["v4"] }
 
 [dev-dependencies]
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+tokio-postgres = "0.7.18"
 tempfile = "3"
 tokio-util = "0.7"
 http-body-util = "0.1"
