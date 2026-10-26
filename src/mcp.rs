@@ -10,8 +10,10 @@ use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::Value;
 
-pub const WRITES: [&str; 7] = [
+pub const WRITES: [&str; 9] = [
     "respond",
+    "hold_run",
+    "release_run",
     "cancel_run",
     "cancel_tree",
     "pause_definition",
@@ -100,6 +102,14 @@ pub struct RunMutation {
     pub meta: Mutation,
 }
 #[derive(Deserialize, JsonSchema)]
+pub struct HoldMutation {
+    pub run: String,
+    /// Optional note shown beside the hold.
+    pub note: Option<String>,
+    #[serde(flatten)]
+    pub meta: Mutation,
+}
+#[derive(Deserialize, JsonSchema)]
 pub struct DefinitionMutation {
     pub definition: String,
     pub note: Option<String>,
@@ -150,7 +160,7 @@ impl Mcp {
         })
     }
     #[tool(
-        description = "Inspect state, lease, waits, mailbox, calls with their annotations, per-run annotation totals (gen_ai.usage.input_tokens/output_tokens), owned children, jump budget and pinned trace/span ids.",
+        description = "Inspect state, hold (who held it), interruption, version digest and pinned flag, host data, lease, waits, mailbox, calls with their annotations, per-run annotation totals (gen_ai.usage.input_tokens/output_tokens), owned children, jump budget and pinned trace/span ids.",
         annotations(read_only_hint = true)
     )]
     async fn inspect_run(
@@ -205,7 +215,7 @@ impl Mcp {
         .await
     }
     #[tool(
-        description = "Page definitions in name order: versions, active version, epoch, breaker (including manual pause attribution) and schedules with next due times.",
+        description = "Page definitions in name order: versions with content digest and breaker policy, active version, epoch, breaker trip (with digest and manual pause attribution) and schedules with next due times.",
         annotations(read_only_hint = true)
     )]
     async fn list_definitions(
@@ -277,6 +287,31 @@ impl Mcp {
     ) -> std::result::Result<CallToolResult, ErrorData> {
         self.command(p.meta, Command::Cancel { run: p.run }).await
     }
+    #[tool(
+        description = "Hold a run and its live owned descendants: nothing is claimed or due until released. A call already dispatched still records its answer. Idempotent; ended runs are left alone."
+    )]
+    async fn hold_run(
+        &self,
+        Parameters(p): Parameters<HoldMutation>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.command(
+            p.meta,
+            Command::Hold {
+                run: p.run,
+                note: p.note.unwrap_or_default(),
+            },
+        )
+        .await
+    }
+    #[tool(
+        description = "Release a held run and its held descendants; they continue from the same place."
+    )]
+    async fn release_run(
+        &self,
+        Parameters(p): Parameters<RunMutation>,
+    ) -> std::result::Result<CallToolResult, ErrorData> {
+        self.command(p.meta, Command::Release { run: p.run }).await
+    }
     #[tool(description = "Cancel the owned run tree atomically; same semantics as cancel_run.")]
     async fn cancel_tree(
         &self,
@@ -285,7 +320,7 @@ impl Mcp {
         self.command(p.meta, Command::Cancel { run: p.run }).await
     }
     #[tool(
-        description = "Manually pause admissions and schedules for a definition; existing runs finish."
+        description = "Manually pause admissions and schedules for a definition; existing runs finish. A manual pause refuses every version, whatever its content."
     )]
     async fn pause_definition(
         &self,

@@ -7,8 +7,8 @@ publish = false
 
 [dependencies]
 anyhow = "1"
-ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.1.0" }
-ouro-durable = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.1.0" }
+ouro-runtime = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.2.0" }
+ouro-durable = { git = "https://github.com/Ch4mpl00/ouro", tag = "v0.2.0" }
 async-trait = "0.1"
 axum = { version = "0.8", features = ["form", "query"] }
 base64 = "0.22"

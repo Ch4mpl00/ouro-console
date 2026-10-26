@@ -340,8 +340,11 @@ async fn opaque_paging_mappings_and_error_classification(backend: Backend) {
             .unwrap()
             .tripped,
         Some(Trip::Automatic {
-            faults: 1,
-            threshold: 1,
+            breaker: BreakerTrip {
+                faults: 1,
+                threshold: 1,
+                ..
+            },
             ..
         })
     ));
@@ -710,7 +713,7 @@ async fn read_only_refuses_a_newer_schema_version() {
     let path = spec.strip_prefix("sqlite:").unwrap();
     rusqlite::Connection::open(path)
         .unwrap()
-        .execute_batch("PRAGMA user_version = 999")
+        .execute_batch("INSERT INTO ouro_migrations VALUES (999)")
         .unwrap();
     for read_only in [true, false] {
         let error = match OuroControl::connect(spec, read_only).await {
@@ -722,6 +725,38 @@ async fn read_only_refuses_a_newer_schema_version() {
             "{error}"
         );
     }
+}
+#[tokio::test]
+async fn a_v0_1_0_sqlite_file_is_refused_as_legacy_and_left_alone() {
+    // v0.1.0 recorded its schema in `user_version`: rows, no `ouro_migrations`.
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("legacy.sqlite");
+    rusqlite::Connection::open(&path)
+        .unwrap()
+        .execute_batch(
+            "CREATE TABLE ouro_rows (kind TEXT, id TEXT, value TEXT); PRAGMA user_version = 1",
+        )
+        .unwrap();
+    let spec = format!("sqlite:{}", path.display());
+    for read_only in [true, false] {
+        let error = match OuroControl::connect(&spec, read_only).await {
+            Ok(_) => panic!("a v0.1.0 file must be refused"),
+            Err(error) => error,
+        };
+        assert!(
+            matches!(&error, ControlError::Unavailable(m) if m.contains("earlier release")),
+            "{error}"
+        );
+    }
+    let tables: i64 = rusqlite::Connection::open(&path)
+        .unwrap()
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE name = 'ouro_migrations'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(tables, 0);
 }
 async fn definition_totals_run_totals_and_activations_come_from_ouro(backend: Backend) {
     let fixture = Fixture::new(&backend).await;

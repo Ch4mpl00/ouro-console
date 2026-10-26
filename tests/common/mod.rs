@@ -2,7 +2,7 @@
 use ouro_console::{client::*, fake::FakeControl, ouro::OuroControl};
 use ouro_durable::{AtomicBackend, Clock, RunStore, TransactionalStore};
 use ouro_runtime::{
-    Config, Function, FunctionContext, Output, Registry, Runtime,
+    Config, Function, FunctionContext, Output, Registry, Runtime, Start,
     control::Control,
     durable::Compatibility,
     opentelemetry::{
@@ -233,9 +233,16 @@ impl Fixture {
         let review = workflow(
             "  - echo: { call: echo, with: { marker: original } }\n  - decision: { listen: { to: { one: { with: { type: review.decision } } } } }\n  - result: { set: { continued: true } }",
         );
+        // Version 2 sets its own breaker policy, the cleanup definition turns it off.
+        let with_policy = |yaml: &str, policy: &str| {
+            yaml.replace(
+                "version: '1.0.0' }",
+                &format!("version: '1.0.0', metadata: {{ ouro: {{ breaker: {policy} }} }} }}"),
+            )
+        };
         for (name, yaml) in [
             ("review", review.clone()),
-            ("review", review),
+            ("review", with_policy(&review, "{ threshold: 5 }")),
             (
                 "transform",
                 workflow(
@@ -250,8 +257,11 @@ impl Fixture {
             ),
             (
                 "cleanup",
-                workflow("  - done: { set: { done: true } }")
-                    .replace("\ndo:", "\nschedule: { every: PT1H }\ndo:"),
+                with_policy(
+                    &workflow("  - done: { set: { done: true } }")
+                        .replace("\ndo:", "\nschedule: { every: PT1H }\ndo:"),
+                    "off",
+                ),
             ),
         ] {
             let d = runtime.save(name, &yaml).await.unwrap();
@@ -279,7 +289,21 @@ impl Fixture {
             ("run-006", "review"),
             ("run-010", "transform"),
         ] {
-            if matches!(id, "run-002" | "run-003") {
+            if id == "run-001" {
+                // Started at a named version, with host data.
+                runtime
+                    .start_with(
+                        id,
+                        name,
+                        json!({}),
+                        Start {
+                            version: Some(1),
+                            host: json!({"tenant":"demo","ticket":"T-1"}),
+                        },
+                    )
+                    .await
+                    .unwrap();
+            } else if matches!(id, "run-002" | "run-003") {
                 runtime
                     .start(id, name, json!({}))
                     .with_context(admitted.clone())
@@ -323,11 +347,25 @@ impl Fixture {
             .unwrap()
             .unwrap();
         runtime
-            .start_child(&fence, "/child", "run-007", "review", json!({}))
+            .start_child(
+                &fence,
+                "/child",
+                "run-007",
+                "review",
+                json!({}),
+                Value::Null,
+            )
             .await
             .unwrap();
         runtime
-            .start_child(&fence, "/ended", "run-009", "cleanup", json!({}))
+            .start_child(
+                &fence,
+                "/ended",
+                "run-009",
+                "cleanup",
+                json!({}),
+                Value::Null,
+            )
             .await
             .unwrap();
         runtime.drive("run-009", &stop).await.unwrap();
@@ -337,10 +375,29 @@ impl Fixture {
             .unwrap()
             .unwrap();
         runtime
-            .start_child(&child_fence, "/grandchild", "run-008", "review", json!({}))
+            .start_child(
+                &child_fence,
+                "/grandchild",
+                "run-008",
+                "review",
+                json!({}),
+                Value::Null,
+            )
             .await
             .unwrap();
         store.release(&child_fence, clock.now_ms()).await.unwrap();
+        control
+            .hold(
+                &ouro_runtime::control::Request {
+                    id: "demo-hold".into(),
+                    actor: "demo-operator".into(),
+                    reason: "inspect the downstream effect".into(),
+                },
+                "run-008",
+                "release after review",
+            )
+            .await
+            .unwrap();
         control
             .pause(
                 &ouro_runtime::control::Request {

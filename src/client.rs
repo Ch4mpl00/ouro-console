@@ -85,6 +85,15 @@ pub enum Command {
     Cancel {
         run: String,
     },
+    /// Freeze a run and its live owned descendants until `Release`.
+    Hold {
+        run: String,
+        note: String,
+    },
+    /// Let a held run and its held descendants continue.
+    Release {
+        run: String,
+    },
     Pause {
         definition: String,
         note: String,
@@ -104,7 +113,10 @@ pub enum Command {
 impl Command {
     pub fn run(&self) -> Option<&str> {
         match self {
-            Self::Cancel { run } | Self::Respond { run, .. } => Some(run),
+            Self::Cancel { run }
+            | Self::Hold { run, .. }
+            | Self::Release { run }
+            | Self::Respond { run, .. } => Some(run),
             _ => None,
         }
     }
@@ -165,6 +177,52 @@ pub struct SavedRun {
     /// ouro keeps them on the run row.
     #[serde(default)]
     pub annotations: BTreeMap<String, serde_json::Number>,
+    /// Who froze the run and why, while an operator's hold stands.
+    #[serde(default)]
+    pub held: Option<Hold>,
+    /// The worker stopped before the run ended and left it recoverable
+    /// (a lost lease, a hold, the emergency stop, a call it had to abandon).
+    #[serde(default)]
+    pub interrupted: bool,
+    /// The host data the run was admitted with, when it has any. Only an
+    /// inspection of the run itself carries it; lists show it hidden.
+    #[serde(default)]
+    pub host: Option<HostData>,
+}
+/// An operator's hold on a run, as ouro recorded it.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
+pub struct Hold {
+    pub actor: String,
+    pub reason: String,
+    pub note: String,
+    pub at_ms: i64,
+}
+/// The host's data of a run. ouro's list queries replace it with a marker;
+/// only `inspect` of the run shows it.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "visibility", content = "data", rename_all = "snake_case")]
+pub enum HostData {
+    Hidden,
+    Shown(Value),
+}
+/// A definition version's breaker policy (`document.metadata.ouro.breaker`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Breaker {
+    /// The host's default threshold applies.
+    Inherit,
+    /// Faults are counted and never trip.
+    Off,
+    Threshold(u32),
+}
+impl Breaker {
+    pub fn label(self) -> String {
+        match self {
+            Self::Inherit => "inherit".into(),
+            Self::Off => "off".into(),
+            Self::Threshold(n) => format!("threshold {n}"),
+        }
+    }
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Lease {
@@ -220,22 +278,43 @@ pub struct Inspection {
     /// The span context the run was admitted in, when there was one.
     pub trace_id: Option<String>,
     pub span_id: Option<String>,
+    /// The run was started at a version the host named.
+    #[serde(default)]
+    pub pinned: bool,
+    /// The content digest its version had when the run was admitted; empty
+    /// when the catalog did not hold that version.
+    #[serde(default)]
+    pub digest: String,
 }
-#[derive(Clone, Debug, Serialize, Deserialize)]
+/// The breaker's own trip: its threshold observation.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BreakerTrip {
+    pub faults: u32,
+    pub threshold: u32,
+    pub run: String,
+    pub error: String,
+    pub at_ms: i64,
+}
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Trip {
+    /// An operator's pause: refuses every admission, whatever version or
+    /// content. When the breaker had tripped before, its report stays beside.
     Manual {
         actor: String,
         reason: String,
         note: String,
         at_ms: i64,
+        /// The active version's content digest when the pause or trip began.
+        digest: String,
+        breaker: Option<BreakerTrip>,
     },
+    /// The breaker: refuses admissions whose definition has `digest` (and
+    /// versions the catalog does not hold); only an activation clears it.
     Automatic {
-        faults: u32,
-        threshold: u32,
-        run: String,
-        error: String,
-        at_ms: i64,
+        #[serde(flatten)]
+        breaker: BreakerTrip,
+        digest: String,
     },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -246,6 +325,10 @@ pub struct Version {
     /// Who activated it and why, when the host said.
     pub activated_by: Option<String>,
     pub activation_note: Option<String>,
+    /// The version's content digest.
+    pub digest: String,
+    /// The version's own breaker policy.
+    pub breaker: Breaker,
 }
 /// One definition's annotation totals over a window of ended runs. The
 /// window is rounded out to whole hours by ouro.
@@ -353,6 +436,20 @@ pub trait ControlClient: Send + Sync {
     }
     async fn cancel_tree(&self, request: &Request, run: &str) -> Result<Reply> {
         self.cancel(request, run).await
+    }
+    async fn hold(&self, request: &Request, run: &str, note: &str) -> Result<Reply> {
+        self.execute(
+            request,
+            &Command::Hold {
+                run: run.into(),
+                note: note.into(),
+            },
+        )
+        .await
+    }
+    async fn release(&self, request: &Request, run: &str) -> Result<Reply> {
+        self.execute(request, &Command::Release { run: run.into() })
+            .await
     }
     async fn pause(&self, request: &Request, definition: &str, note: &str) -> Result<Reply> {
         self.execute(

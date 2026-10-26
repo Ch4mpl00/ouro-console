@@ -76,17 +76,128 @@ async fn pause_resume_preserves_epoch_breaker_counts_and_automatic_trip() {
     assert_eq!(before.epoch, after.epoch);
     assert_eq!(before.faults, after.faults);
     assert!(after.tripped.is_none());
-    assert_eq!(
-        c.pause(&req("pause-tripped"), "archive", "test")
-            .await
-            .unwrap(),
-        Reply::Changed(false)
-    );
+    // The breaker tripped: a resume is refused and records nothing.
     assert!(matches!(
         c.resume(&req("auto"), "archive").await,
         Err(ControlError::Conflict(_))
     ));
     assert!(c.entry("auto").await.unwrap().is_none());
+    // A pause records itself beside the trip and keeps the breaker's report;
+    // resume lifts the pause alone, the trip stands.
+    let tripped = c.definition("archive").await.unwrap().unwrap().tripped;
+    assert_eq!(
+        c.pause(&req("pause-tripped"), "archive", "test")
+            .await
+            .unwrap(),
+        Reply::Changed(true)
+    );
+    assert!(matches!(
+        c.definition("archive").await.unwrap().unwrap().tripped,
+        Some(Trip::Manual {
+            breaker: Some(_),
+            ..
+        })
+    ));
+    assert_eq!(
+        c.pause(&req("pause-again"), "archive", "test")
+            .await
+            .unwrap(),
+        Reply::Changed(false)
+    );
+    assert_eq!(
+        c.resume(&req("lift"), "archive").await.unwrap(),
+        Reply::Changed(true)
+    );
+    assert_eq!(
+        c.definition("archive").await.unwrap().unwrap().tripped,
+        tripped
+    );
+}
+#[tokio::test]
+async fn hold_freezes_the_live_tree_and_release_lets_it_go() {
+    let c = FakeControl::new();
+    let held = |id: &'static str| {
+        let c = &c;
+        async move { c.inspect(id).await.unwrap().unwrap().run.held }
+    };
+    // The demo already holds one leaf.
+    let leaf = held("run-008").await.unwrap();
+    assert_eq!(leaf.actor, "demo-operator");
+    assert_eq!(
+        c.hold(&req("hold"), "run-002", "look at it").await.unwrap(),
+        Reply::Changed(true)
+    );
+    // The run and its live descendants are held; the ended child is left alone,
+    // and a hold already standing keeps its first attribution.
+    let top = held("run-002").await.unwrap();
+    assert_eq!(
+        (top.actor.as_str(), top.note.as_str()),
+        ("operator", "look at it")
+    );
+    assert_eq!(top.reason, "investigate");
+    assert!(held("run-007").await.is_some());
+    assert_eq!(held("run-008").await.unwrap(), leaf);
+    assert!(held("run-009").await.is_none());
+    assert_eq!(
+        c.hold(&req("hold-2"), "run-002", "").await.unwrap(),
+        Reply::Changed(false)
+    );
+    // Independent runs stay as they are; an ended run is never held.
+    assert!(held("run-001").await.is_none());
+    assert_eq!(
+        c.hold(&req("hold-ended"), "run-004", "").await.unwrap(),
+        Reply::Changed(false)
+    );
+    // The listing and the counts show it.
+    let page = c.list(&Runs::default(), None, 100).await.unwrap();
+    assert!(
+        page.items
+            .iter()
+            .any(|r| r.id == "run-002" && r.held.is_some())
+    );
+    let counts = c
+        .counts(
+            &Runs {
+                definition: Some("review".into()),
+                ..Default::default()
+            },
+            false,
+            None,
+            100,
+        )
+        .await
+        .unwrap();
+    assert_eq!(counts.states.get("held"), Some(&1));
+    assert_eq!(
+        c.release(&req("release"), "run-002").await.unwrap(),
+        Reply::Changed(true)
+    );
+    for id in ["run-002", "run-007", "run-008"] {
+        assert!(held(id).await.is_none());
+    }
+    assert_eq!(
+        c.release(&req("release-2"), "run-002").await.unwrap(),
+        Reply::Changed(false)
+    );
+    assert!(matches!(
+        c.hold(&req("hold-missing"), "nope", "").await,
+        Err(ControlError::NotFound(_))
+    ));
+    // A cancellation ends a hold.
+    c.hold(&req("hold-3"), "run-003", "").await.unwrap();
+    c.cancel(&req("cancel-held"), "run-003").await.unwrap();
+    let cancelled = c.inspect("run-003").await.unwrap().unwrap().run;
+    assert!(cancelled.held.is_none() && cancelled.state == RunState::Cancelled);
+}
+#[tokio::test]
+async fn lists_hide_host_data_and_inspect_shows_it() {
+    let c = FakeControl::new();
+    let shown = c.inspect("run-001").await.unwrap().unwrap().run.host;
+    assert!(matches!(shown, Some(HostData::Shown(_))));
+    let listed = c.list(&Runs::default(), None, 100).await.unwrap();
+    let run = listed.items.iter().find(|r| r.id == "run-001").unwrap();
+    assert_eq!(run.host, Some(HostData::Hidden));
+    assert!(listed.items.iter().any(|r| r.host.is_none()));
 }
 #[tokio::test]
 async fn bounded_pages_allow_empty_matches_and_bind_cursors_to_query() {
