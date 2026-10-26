@@ -53,6 +53,8 @@ fn every_script_command_parses_and_mutations_require_reason() {
     for args in [
         vec!["cancel-run", "run-002"],
         vec!["cancel-tree", "run-002"],
+        vec!["hold-run", "run-002", "--note", "look"],
+        vec!["release-run", "run-002"],
         vec!["pause-definition", "review"],
         vec!["resume-definition", "cleanup"],
         vec!["stop-all"],
@@ -177,11 +179,67 @@ async fn script_dispatch_uses_shared_client_and_read_only_policy(backend: Backen
             .iter()
             .any(|c| c["annotations"]["gen_ai.usage.output_tokens"].is_number())
     );
+    let hold = cli::execute(
+        &session,
+        parse(vec![
+            "hold-run",
+            "run-002",
+            "--note",
+            "look at it",
+            "--reason",
+            "investigate",
+            "--request-id",
+            "cli-hold",
+        ]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(hold["request"]["actor"], "script-operator");
+    assert_eq!(hold["command"]["command"], "hold");
+    assert_eq!(hold["reply"]["Changed"], true);
+    let held = cli::execute(&session, parse(vec!["inspect", "run-002"]))
+        .await
+        .unwrap();
+    assert_eq!(held["run"]["held"]["actor"], "script-operator");
+    assert_eq!(held["run"]["held"]["note"], "look at it");
+    assert!(held["digest"].is_string() && held["pinned"] == false);
+    let release = cli::execute(
+        &session,
+        parse(vec!["release-run", "run-002", "--reason", "done"]),
+    )
+    .await
+    .unwrap();
+    assert_eq!(release["reply"]["Changed"], true);
+    let released = cli::execute(&session, parse(vec!["inspect", "run-002"]))
+        .await
+        .unwrap();
+    assert!(released["run"]["held"].is_null());
+    let hidden = cli::execute(&session, parse(vec!["runs", "--limit", "100"]))
+        .await
+        .unwrap();
+    assert!(
+        hidden["items"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["host"]["visibility"] == "hidden")
+    );
     session.read_only = true;
-    assert!(matches!(
-        cli::execute(&session, parse(vec!["resume-all", "--reason", "test"])).await,
-        Err(ControlError::ReadOnly)
-    ));
+    for args in [
+        vec!["resume-all", "--reason", "test"],
+        vec!["hold-run", "run-002", "--reason", "test"],
+        vec!["release-run", "run-008", "--reason", "test"],
+    ] {
+        assert!(matches!(
+            cli::execute(&session, parse(args)).await,
+            Err(ControlError::ReadOnly)
+        ));
+    }
+    // The refused hold changed nothing.
+    let after = cli::execute(&session, parse(vec!["inspect", "run-002"]))
+        .await
+        .unwrap();
+    assert!(after["run"]["held"].is_null());
 }
 #[test]
 fn token_configuration_rejects_empty_or_whitespace_values() {

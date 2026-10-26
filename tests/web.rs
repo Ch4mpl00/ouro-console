@@ -283,6 +283,8 @@ async fn each_action_mutates_and_returns_attributed_receipt(backend: Backend) {
     for (action, target) in [
         ("cancel", ("run", "run-002")),
         ("cancel-tree", ("run", "run-002")),
+        ("hold", ("run", "run-002")),
+        ("release", ("run", "run-008")),
         ("pause", ("definition", "review")),
         ("resume", ("definition", "cleanup")),
         ("stop-all", ("x", "")),
@@ -333,6 +335,24 @@ async fn each_action_mutates_and_returns_attributed_receipt(backend: Backend) {
                     RunState::Completed
                 );
             }
+            "hold" => {
+                let held = fixture.inspect("run-007").await.unwrap().unwrap().run.held;
+                let held = held.unwrap();
+                assert_eq!(
+                    (held.actor.as_str(), held.note.as_str()),
+                    ("test-operator", "maintenance")
+                );
+            }
+            "release" => assert!(
+                fixture
+                    .inspect("run-008")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .run
+                    .held
+                    .is_none()
+            ),
             "pause" => assert!(matches!(
                 fixture.definition("review").await.unwrap().unwrap().tripped,
                 Some(Trip::Manual { .. })
@@ -371,6 +391,8 @@ async fn all_mutations_reject_missing_reason_confirmation_or_request_id(backend:
     for action in [
         "cancel",
         "cancel-tree",
+        "hold",
+        "release",
         "pause",
         "resume",
         "stop-all",
@@ -501,6 +523,8 @@ async fn read_only_hides_and_denies_every_action(backend: Backend) {
     for action in [
         "cancel",
         "cancel-tree",
+        "hold",
+        "release",
         "pause",
         "resume",
         "stop-all",
@@ -515,6 +539,125 @@ async fn read_only_hides_and_denies_every_action(backend: Backend) {
         );
     }
     assert!(!fixture.stopped().await.unwrap());
+    // Nothing was held by the refused attempts.
+    assert!(
+        fixture
+            .inspect("run-002")
+            .await
+            .unwrap()
+            .unwrap()
+            .run
+            .held
+            .is_none()
+    );
+}
+/// The run page and the lists show what ouro 0.2 adds: the hold and who set
+/// it, the version digest and the pinned flag, call outcomes and host data.
+async fn pages_show_holds_digests_breaker_policy_outcomes_and_host_data(backend: Backend) {
+    let (app, fixture) = setup(false, &backend).await;
+    let digests: Vec<_> = fixture
+        .definition("review")
+        .await
+        .unwrap()
+        .unwrap()
+        .versions
+        .into_iter()
+        .map(|v| v.digest)
+        .collect();
+    let short = |digest: &str| digest.chars().take(12).collect::<String>();
+    // Lists: a held run is marked, host data is hidden, never shown.
+    let (code, runs) = request(&app, "GET", "/runs?limit=100", "", &[]).await;
+    assert_eq!(code, StatusCode::OK, "{runs}");
+    assert!(runs.contains("held by demo-operator"), "{runs}");
+    assert!(runs.contains("host data (hidden)"), "{runs}");
+    assert!(
+        !runs.contains("&lt;redacted&gt;") && !runs.contains("T-1"),
+        "{runs}"
+    );
+    assert!(runs.contains(">Hold<"), "{runs}");
+    // The run page of a pinned run with host data and a leaf held by an operator.
+    let (code, page) = request(&app, "GET", "/runs/run-001", "", &[]).await;
+    assert_eq!(code, StatusCode::OK, "{page}");
+    for wanted in [
+        "Version digest",
+        "pinned version",
+        "Host data",
+        "T-1",
+        "tenant",
+    ] {
+        assert!(page.contains(wanted), "{wanted}: {page}");
+    }
+    assert!(page.contains(&short(&digests[0])), "{page}");
+    let (_, page) = request(&app, "GET", "/runs/run-002", "", &[]).await;
+    assert!(page.contains("started at the active version"), "{page}");
+    assert!(page.contains(&short(&digests[1])), "{page}");
+    assert!(page.contains("Hold run"), "{page}");
+    let (code, leaf) = request(&app, "GET", "/runs/run-008", "", &[]).await;
+    assert_eq!(code, StatusCode::OK, "{leaf}");
+    for wanted in [
+        "Held",
+        "demo-operator",
+        "inspect the downstream effect",
+        "release after review",
+        "Release run",
+    ] {
+        assert!(leaf.contains(wanted), "{wanted}: {leaf}");
+    }
+    assert!(!leaf.contains("Hold run"), "{leaf}");
+    if !fixture.is_real() {
+        // Outcomes that are no plain answer say what they mean for the effect.
+        let (_, calls) = request(&app, "GET", "/runs/run-002", "", &[]).await;
+        for wanted in [
+            "proven not executed: no effect",
+            "may have run; never sent again",
+        ] {
+            assert!(calls.contains(wanted), "{wanted}: {calls}");
+        }
+        let (_, interrupted) = request(&app, "GET", "/runs/run-001", "", &[]).await;
+        for wanted in [
+            "interrupted: sent again when the run recovers",
+            "Last interruption",
+        ] {
+            assert!(interrupted.contains(wanted), "{wanted}: {interrupted}");
+        }
+    }
+    // Definitions: digest and breaker policy per version, and the trip's digest.
+    let (code, defs) = request(&app, "GET", "/definitions", "", &[]).await;
+    assert_eq!(code, StatusCode::OK, "{defs}");
+    for wanted in ["breaker policy", "threshold 5", "inherit", "off", "digest"] {
+        assert!(defs.contains(wanted), "{wanted}: {defs}");
+    }
+    assert!(
+        defs.contains("refuses every admission of every version"),
+        "{defs}"
+    );
+    assert!(
+        defs.contains("Refuses admissions with content digest"),
+        "{defs}"
+    );
+    // A hold through the page is shown as held afterwards.
+    let body = form(&[
+        ("reason", "look"),
+        ("confirmed", "true"),
+        ("request_id", "page-hold"),
+        ("run", "run-002"),
+    ]);
+    assert_eq!(
+        request(&app, "POST", "/actions/hold", &body, &[]).await.0,
+        StatusCode::OK
+    );
+    let (_, page) = request(&app, "GET", "/runs/run-002", "", &[]).await;
+    assert!(
+        page.contains("Release run") && page.contains("test-operator"),
+        "{page}"
+    );
+    // Read-only pages carry no hold control.
+    let (read_only, _) = setup(true, &backend).await;
+    let (_, page) = request(&read_only, "GET", "/runs/run-008", "", &[]).await;
+    assert!(
+        page.contains("demo-operator") && !page.contains("Release run"),
+        "{page}"
+    );
 }
 async fn bearer_auth_covers_pages_assets_and_mcp_and_remote_bind_requires_it(backend: Backend) {
     assert!(WebConfig::new("0.0.0.0:8090".parse().unwrap(), None, None).is_err());
@@ -649,6 +792,7 @@ common::backend_tests!(
     all_mutations_reject_missing_reason_confirmation_or_request_id,
     json_answers_reject_invalid_payloads_and_breaker_resume_conflicts,
     read_only_hides_and_denies_every_action,
+    pages_show_holds_digests_breaker_policy_outcomes_and_host_data,
     bearer_auth_covers_pages_assets_and_mcp_and_remote_bind_requires_it,
     embedded_assets_and_trace_configuration_are_valid
 );

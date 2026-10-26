@@ -503,6 +503,216 @@ async fn opaque_paging_mappings_and_error_classification(backend: Backend) {
         Err(ControlError::NotFound(_))
     ));
 }
+/// Hold and release, the digests and breaker policies, the trip's digest and
+/// the host data's visibility: one contract for the fake and for ouro.
+async fn holds_digests_breaker_policy_and_host_data_follow_ouro(backend: Backend) {
+    let fixture = Fixture::new(&backend).await;
+    let request = |id: &str| Request {
+        id: id.into(),
+        actor: "operator".into(),
+        reason: "investigate".into(),
+    };
+    let definitions = fixture.definitions(None, 100).await.unwrap().items;
+    let definition = |name: &str| definitions.iter().find(|d| d.name == name).unwrap();
+    let review = &definition("review").versions;
+    assert_eq!(review.len(), 2);
+    assert_eq!(review[0].breaker, Breaker::Inherit);
+    assert_eq!(review[1].breaker, Breaker::Threshold(5));
+    assert!(review.iter().all(|v| !v.digest.is_empty()));
+    assert_ne!(review[0].digest, review[1].digest);
+    assert_eq!(definition("cleanup").versions[0].breaker, Breaker::Off);
+    // The trip carries the digest of the version that tripped; a pause does too.
+    let archive = definition("archive");
+    let active = |d: &Definition| {
+        d.versions
+            .iter()
+            .find(|v| Some(&v.version) == d.active.as_ref())
+            .unwrap()
+            .digest
+            .clone()
+    };
+    match archive.tripped.as_ref().unwrap() {
+        Trip::Automatic { digest, .. } => assert_eq!(digest, &active(archive)),
+        other => panic!("{other:?}"),
+    }
+    match definition("cleanup").tripped.as_ref().unwrap() {
+        Trip::Manual {
+            digest, breaker, ..
+        } => {
+            assert_eq!(digest, &active(definition("cleanup")));
+            assert!(breaker.is_none());
+        }
+        other => panic!("{other:?}"),
+    }
+    // A pause of a tripped definition keeps the breaker's report beside it;
+    // resume lifts the pause alone.
+    assert_eq!(
+        fixture
+            .pause(&request("pause-tripped"), "archive", "while investigating")
+            .await
+            .unwrap(),
+        Reply::Changed(true)
+    );
+    let paused = fixture.definition("archive").await.unwrap().unwrap();
+    assert!(matches!(
+        paused.tripped,
+        Some(Trip::Manual {
+            breaker: Some(_),
+            ..
+        })
+    ));
+    assert_eq!(
+        fixture
+            .resume(&request("lift-pause"), "archive")
+            .await
+            .unwrap(),
+        Reply::Changed(true)
+    );
+    assert_eq!(
+        fixture
+            .definition("archive")
+            .await
+            .unwrap()
+            .unwrap()
+            .tripped,
+        archive.tripped
+    );
+    // The run: a pinned start with host data shows both on inspection only.
+    let pinned = fixture.inspect("run-001").await.unwrap().unwrap();
+    assert!(pinned.pinned);
+    assert_eq!(pinned.digest, review[0].digest);
+    assert_eq!(
+        pinned.run.host,
+        Some(HostData::Shown(json!({"tenant":"demo","ticket":"T-1"})))
+    );
+    let plain = fixture.inspect("run-002").await.unwrap().unwrap();
+    assert!(!plain.pinned);
+    assert_eq!(plain.digest, review[1].digest);
+    assert_eq!(plain.run.host, None);
+    let listed = fixture.list(&Runs::default(), None, 100).await.unwrap();
+    let host = |id: &str| {
+        listed
+            .items
+            .iter()
+            .find(|r| r.id == id)
+            .unwrap()
+            .host
+            .clone()
+    };
+    assert_eq!(host("run-001"), Some(HostData::Hidden));
+    assert_eq!(host("run-002"), None);
+    for child in &plain.children {
+        assert_eq!(child.host, None);
+    }
+    // An operator's hold on a leaf stands; holding its ancestor freezes the
+    // live tree and keeps the first attribution.
+    let held = |id: &'static str| {
+        let fixture = &fixture;
+        async move { fixture.inspect(id).await.unwrap().unwrap().run.held }
+    };
+    let leaf = held("run-008").await.unwrap();
+    assert_eq!(leaf.actor, "demo-operator");
+    assert_eq!(leaf.note, "release after review");
+    assert_eq!(
+        fixture
+            .hold(&request("hold-tree"), "run-002", "look at the tree")
+            .await
+            .unwrap(),
+        Reply::Changed(true)
+    );
+    let top = held("run-002").await.unwrap();
+    assert_eq!(
+        (top.actor.as_str(), top.reason.as_str(), top.note.as_str()),
+        ("operator", "investigate", "look at the tree")
+    );
+    assert!(held("run-007").await.is_some());
+    assert_eq!(held("run-008").await.unwrap(), leaf);
+    assert!(
+        held("run-009").await.is_none(),
+        "an ended child is not held"
+    );
+    assert!(held("run-001").await.is_none());
+    assert_eq!(
+        fixture
+            .hold(&request("hold-again"), "run-002", "")
+            .await
+            .unwrap(),
+        Reply::Changed(false)
+    );
+    let filter = Runs {
+        definition: Some("review".into()),
+        ..Default::default()
+    };
+    let counts = fixture.counts(&filter, false, None, 100).await.unwrap();
+    assert!(
+        counts.states.get("held").copied().unwrap_or(0) >= 1,
+        "{counts:?}"
+    );
+    assert_eq!(
+        fixture
+            .release(&request("release-tree"), "run-002")
+            .await
+            .unwrap(),
+        Reply::Changed(true)
+    );
+    for id in ["run-002", "run-007", "run-008"] {
+        assert!(held(id).await.is_none(), "{id}");
+    }
+    assert_eq!(
+        fixture
+            .release(&request("release-again"), "run-002")
+            .await
+            .unwrap(),
+        Reply::Changed(false)
+    );
+    assert!(matches!(
+        fixture.hold(&request("hold-missing"), "missing", "").await,
+        Err(ControlError::NotFound(_))
+    ));
+    assert!(matches!(
+        fixture
+            .release(&request("release-missing"), "missing")
+            .await,
+        Err(ControlError::NotFound(_))
+    ));
+    // Both commands are in the run's operator journal.
+    let journal = fixture.journal(Some("run-002"), None, 100).await.unwrap();
+    let commands: Vec<_> = journal.items.iter().map(|e| e.command.clone()).collect();
+    assert!(commands.iter().any(|c| matches!(c, Command::Hold { .. })));
+    assert!(
+        commands
+            .iter()
+            .any(|c| matches!(c, Command::Release { .. }))
+    );
+    if let Some(spec) = fixture.spec.as_deref() {
+        // The engine recorded the same hold, and a read-only connection
+        // refuses both commands with the typed error, writing nothing.
+        let raw = fixture
+            .real
+            .as_ref()
+            .unwrap()
+            .control
+            .entry("hold-tree")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(raw.request.actor, "operator");
+        let read_only = OuroControl::connect(spec, true).await.unwrap();
+        assert!(matches!(
+            read_only.hold(&request("ro-hold"), "run-002", "").await,
+            Err(ControlError::ReadOnly)
+        ));
+        assert!(matches!(
+            read_only.release(&request("ro-release"), "run-008").await,
+            Err(ControlError::ReadOnly)
+        ));
+        assert!(fixture.entry("ro-hold").await.unwrap().is_none());
+        assert!(held("run-002").await.is_none());
+        // A held run is held for the read-only view too.
+        let view = read_only.inspect("run-001").await.unwrap().unwrap();
+        assert!(view.pinned && !view.digest.is_empty());
+    }
+}
 async fn read_only_connection_reads_without_mutating_or_migrating(backend: Backend) {
     let fixture = Fixture::new(&backend).await;
     let real = fixture.real.as_ref().unwrap();
@@ -683,6 +893,14 @@ async fn sqlite_http_cancel_and_respond_are_observed_by_the_runtime() {
 #[tokio::test]
 async fn sqlite_opaque_paging_mappings_and_error_classification() {
     opaque_paging_mappings_and_error_classification(Backend::Sqlite).await;
+}
+#[tokio::test]
+async fn sqlite_holds_digests_breaker_policy_and_host_data_follow_ouro() {
+    holds_digests_breaker_policy_and_host_data_follow_ouro(Backend::Sqlite).await;
+}
+#[tokio::test]
+async fn fake_holds_digests_breaker_policy_and_host_data_follow_the_same_contract() {
+    holds_digests_breaker_policy_and_host_data_follow_ouro(Backend::Fake).await;
 }
 #[tokio::test]
 async fn sqlite_read_only_connection_reads_without_mutating_or_migrating() {
@@ -923,6 +1141,7 @@ async fn cli_processes_select_a_persistent_store_and_environment() {
 async fn postgres_real_store_contract_and_http_end_to_end() {
     let backend = Backend::postgres();
     http_cancel_and_respond_are_observed_by_the_runtime(backend.clone()).await;
+    holds_digests_breaker_policy_and_host_data_follow_ouro(backend.clone()).await;
     opaque_paging_mappings_and_error_classification(backend.clone()).await;
     read_only_connection_reads_without_mutating_or_migrating(backend.clone()).await;
     complex_wait_progress_and_response_replay_are_owned_by_ouro(backend.clone()).await;
