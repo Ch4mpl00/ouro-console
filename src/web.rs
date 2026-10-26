@@ -297,7 +297,7 @@ async fn layout(app: &App, title: &str, subtitle: &str, content: Markup) -> Resu
                     h1 class="page-title" { (title) } p class="text-secondary mt-2 mb-0" { (subtitle) }
                 } div class="col-auto" { span class="badge bg-azure-lt" { (app.session.client.backend_label()) } } } }
                 (content)
-            } footer class="container-xl py-3 text-secondary small" { "Actor: " (app.session.actor) " · ouro-console v0.1" } }
+            } footer class="container-xl py-3 text-secondary small" { "Actor: " (app.session.actor) " · ouro-console v0.2" } }
         } }
     } })
 }
