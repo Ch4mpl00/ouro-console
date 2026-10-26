@@ -9,7 +9,7 @@ Postgres store. Web, MCP, and separate CLI processes address the same persistent
 state when configured with the same store. The console observes and controls
 runs; the embedding ouro host still admits and drives workflows.
 
-`ouro-runtime` and `ouro-durable` are pinned to the Git tag `v0.1.0`. `ows` types come through
+`ouro-runtime` and `ouro-durable` are pinned to the Git tag `v0.2.0`. `ows` types come through
 `ouro-runtime`'s reexport. `--fake` remains available for process-local demos.
 
 ## Run
@@ -45,7 +45,11 @@ selection locally.
 
 Writable connections use ouro's own SQLite/Postgres constructors, including
 schema initialization/migration. Back up a store before opening it with a new
-ouro version. The pinned Postgres adapter uses `NoTls`; use a local database or
+ouro version. **A store written by ouro v0.1.0 cannot be opened:** ouro 0.2
+refuses its run and definition rows by their stored versions and never converts
+them (a 0.1.0 SQLite file fails with `SchemaError::Legacy`, shown here as
+`Unavailable`), so a deployment moving to this console starts a new store with
+the host on ouro 0.2. The pinned Postgres adapter uses `NoTls`; use a local database or
 secure tunnel. Database connections are separate from HTTP bearer protection.
 
 ### Read-only deployment
@@ -70,7 +74,9 @@ for database permissions or deployment authentication.
 
 The demo includes `review`, `transform`, `archive`, and `cleanup` definitions,
 every run state, a three-level owned tree, open decision/signal waits, an
-automatic breaker trip, a manual pause, annotated calls with token counts, and
+automatic breaker trip, a manual pause, annotated calls with token counts and
+every call outcome, a held run, a run started at a named version with host
+data, an interrupted run, version digests with breaker policies, and
 live/stale worker heartbeat rows. Demo actions last until that process exits;
 a separate demo CLI process does not affect a demo server. The fake executes no
 workflows or heartbeat updates.
@@ -79,11 +85,11 @@ workflows or heartbeat updates.
 
 | Route | Contents |
 | --- | --- |
-| `/runs` | Definition/state/age filters, admission or terminal history, cursor paging, 2-second htmx refresh, a tokens column from the runs' own totals with the page's sum, cancel links |
-| `/runs/{id}` | State/version, lease holder and expiry, exact waits, usage (the run's annotation totals, `gen_ai.usage.input_tokens`/`output_tokens` first), call journal with delivery/states/annotations/arguments/results, jump budget, owned descendants including ended children, mailbox, pinned trace/span ids with the configured trace link, cancel/cancel tree |
+| `/runs` | Definition/state/age filters, admission or terminal history, cursor paging, 2-second htmx refresh, a tokens column from the runs' own totals with the page's sum, a `held` marker (the tooltip names who held it), "host data (hidden)" where a run has host data, hold/release and cancel links |
+| `/runs/{id}` | State/version, the version's content digest and whether the run was started at a pinned version, who held it (actor, reason, note, when) and the hold/release control, interruption, the run's host data (the only page that shows it), lease holder and expiry, exact waits, usage (the run's annotation totals, `gen_ai.usage.input_tokens`/`output_tokens` first), call journal with delivery/states/annotations/arguments/results where `not_executed` (proven no effect), `unknown` (may have run, never sent again) and an interrupted at-least-once call (sent again on recovery) are marked, jump budget, owned descendants including ended children, mailbox, pinned trace/span ids with the configured trace link, hold/release, cancel/cancel tree |
 | `/pending` | What runs wait for, matcher/progress/correlation expectations, since time, absolute timeout, approve/reject or JSON data answers |
-| `/definitions` | Paged: versions with their latest activation time, actor and note, active version, epoch, fault count, automatic breaker/manual pause attribution and time, each schedule kind with next due time, overlap, catch-up and queued slot, pause/resume |
-| `/definitions/{name}` | Versions with activation attribution, and the summed annotations (tokens, cost) of the runs that ended in a window: last hour, 24 hours (default), 7 or 30 days |
+| `/definitions` | Paged: versions with their latest activation time, actor and note, content digest and breaker policy (`inherit`, `off` or `threshold N`), active version, epoch, fault count, automatic breaker/manual pause attribution and time, the trip's content digest, each schedule kind (`every`, `cron`, `after`, `at`, `on`) with next due time, overlap, catch-up and queued slot, pause/resume |
+| `/definitions/{name}` | Versions with activation attribution, digest and breaker policy, and the summed annotations (tokens, cost) of the runs that ended in a window: last hour, 24 hours (default), 7 or 30 days |
 | `/workers` | Paged heartbeat rows: live/stale, last beat and expiry, runs held, application version, host, start |
 | `/journal` | Request ID, actor, reason, command, committed reply; optional `?run=…` |
 | `/emergency` | Always accessible from the red header control; current stop flag, confirmed stop/resume with required reason |
@@ -97,9 +103,19 @@ visible and refreshes every two seconds in all page headers.
 Cancel and cancel-tree both cancel the run and transitive **owned** descendants,
 including across terminal children, atomically. Independent runs stay separate.
 Terminal evidence and pending-call delivery semantics are retained. A manual
-pause stops new admissions/schedules while existing work finishes; resume
-preserves epoch and fault count. An automatic breaker trip requires activation
-of a version in the host, outside this console. Emergency stop is a store-wide
+pause stops new admissions/schedules while existing work finishes, and it
+refuses **every** admission of the definition, whatever version or content;
+resume preserves epoch and fault count. An automatic trip refuses only
+admissions whose content digest is the tripped one (and versions the catalog
+does not hold). Pausing a definition its breaker tripped records the pause
+beside the trip and keeps the breaker's report; resume lifts the pause alone. An automatic breaker trip requires activation
+of a version in the host, outside this console. **Hold** freezes a run together with its live owned descendants (ended
+children are left alone): nothing is claimed or due until **release**, a call
+already dispatched still records its answer, and the run continues from the
+same place. Holding is idempotent (a second hold keeps the first attribution),
+an ended run is never held, release also frees the held descendants, and
+cancelling a held run ends the hold. A held run stays live (it counts for
+overlap policies and ceilings) and `counts` reports it as `held`. Emergency stop is a store-wide
 execution gate, not cancellation; clearing it resumes from retained evidence.
 The fake models the flag, with no worker/executor to enforce dispatch boundaries.
 
@@ -156,8 +172,9 @@ takes `definition`. `get_definition_totals` takes `definition` and an optional
 window, `since_ms` and `before_ms` (default: the 24 hours before now), and returns
 the summed annotations (tokens, cost) of the runs that ended in it.
 
-Mutating tools: `respond`, `cancel_run`, `cancel_tree`, `pause_definition`,
-`resume_definition`, `stop_all`, `resume_all`. All require a nonempty `reason`;
+Mutating tools: `respond`, `hold_run`, `release_run`, `cancel_run`,
+`cancel_tree`, `pause_definition`, `resume_definition`, `stop_all`,
+`resume_all`. All require a nonempty `reason`;
 provide `request_id` for reliable retries. They return the request, command,
 timestamp, and reply as JSON. Read-only mode registers only the eight reads and
 refuses attempts to call writes. Inputs have generated JSON Schemas.
@@ -165,7 +182,8 @@ refuses attempts to call writes. Inputs have generated JSON Schemas.
 `list_runs` accepts the run filters above (absolute milliseconds), `history`,
 `cursor`, and `limit`; history requires both time bounds. `inspect_run` and
 `run_log` take `run`. `list_pending` accepts the wait filters, cursor and limit.
-Cancel tools take `run`; definition tools take `definition` and optional `note`.
+Cancel and release tools take `run`; `hold_run` takes `run` and an optional
+`note`; definition tools take `definition` and optional `note`.
 `respond` takes `run`, `wait`, and a complete matching CloudEvent as `event`.
 For example:
 
@@ -211,6 +229,8 @@ ouro-console workers --limit 50
 ouro-console journal --run run-002
 ouro-console counts --definition review --limit 50
 ouro-console status
+ouro-console hold-run run-002 --reason 'investigate' --note 'check the effect' --request-id hold-42
+ouro-console release-run run-002 --reason 'checked'
 ouro-console cancel-run run-002 --reason 'investigate' --request-id cancel-42
 ouro-console cancel-tree run-002 --reason 'stop owned work'
 ouro-console pause-definition review --reason 'maintenance' --note 'check upstream'
@@ -248,6 +268,16 @@ Tabler provides the admin UI, light/dark variables, JavaScript and icons.
 there are no runtime filesystem asset dependencies.
 
 ## Runtime mapping and remaining gaps
+
+Host data (`Runtime::start_with`) is shown only by `inspect` of the run
+itself. ouro's `list`, `history` and an inspection's `children` carry the
+marker `"<redacted>"` in its place; the console maps it to a typed
+`HostData::Hidden` ("host data (hidden)" in the UI, `{"visibility":"hidden"}`
+in JSON) and shows `HostData::Shown(..)` only for the inspected run. The
+inspected run's `digest` is the content digest its version had at admission
+(empty when the catalog did not hold the version) and `pinned` says the host
+named the version. A version's `breaker` is `Inherit`, `Off` or `Threshold(n)`
+from `document.metadata.ouro.breaker`.
 
 The console keeps its own view types. Numeric ouro version IDs are displayed as
 strings (`"none"` for an inactive definition). All six run states, lease
@@ -325,7 +355,8 @@ both `FakeControl` and `OuroControl` on temporary SQLite files. Real fixtures
 use ouro's `Runtime` to save/activate definitions, admit and drive workflows
 (one function answers annotated output with GenAI token counts; two runs are
 admitted inside a known span context), create owned children, pause a
-definition, cancel a run, and write heartbeat rows from two runtimes, one of
+definition, hold a run, start a run at a named version with host data, cancel
+a run, and write heartbeat rows from two runtimes, one of
 them stale. A persisted lease provides a running view. Tests also cover independent-process CLI selection,
 opaque paging, typed error mapping, read-only refusal of an unmigrated or newer
 store, run and definition totals, activation attribution, and HTTP actions

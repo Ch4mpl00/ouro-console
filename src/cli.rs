@@ -104,6 +104,20 @@ pub enum Action {
         #[command(flatten)]
         meta: MutationArgs,
     },
+    /// Hold a run and its live owned descendants until released.
+    HoldRun {
+        run: String,
+        #[arg(long, default_value = "")]
+        note: String,
+        #[command(flatten)]
+        meta: MutationArgs,
+    },
+    /// Release a held run and its held descendants.
+    ReleaseRun {
+        run: String,
+        #[command(flatten)]
+        meta: MutationArgs,
+    },
     PauseDefinition {
         definition: String,
         #[arg(long, default_value = "")]
@@ -382,6 +396,8 @@ pub async fn execute(session: &Session, action: Action) -> Result<Value> {
         Action::CancelRun { run, meta } | Action::CancelTree { run, meta } => {
             (meta, Command::Cancel { run })
         }
+        Action::HoldRun { run, note, meta } => (meta, Command::Hold { run, note }),
+        Action::ReleaseRun { run, meta } => (meta, Command::Release { run }),
         Action::PauseDefinition {
             definition,
             note,

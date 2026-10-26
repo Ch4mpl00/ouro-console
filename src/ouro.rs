@@ -117,6 +117,11 @@ fn page<T, U>(page: api::Page<T>, convert: impl Fn(T) -> Result<U>) -> Result<Pa
 fn command(command: &Command) -> api::Command {
     match command {
         Command::Cancel { run } => api::Command::Cancel { run: run.clone() },
+        Command::Hold { run, note } => api::Command::Hold {
+            run: run.clone(),
+            note: note.clone(),
+        },
+        Command::Release { run } => api::Command::Release { run: run.clone() },
         Command::Pause { definition, note } => api::Command::Pause {
             definition: definition.clone(),
             note: note.clone(),
@@ -141,6 +146,8 @@ fn reply(reply: api::Reply) -> Reply {
 fn entry(entry: api::Entry) -> Entry {
     let command = match entry.command {
         api::Command::Cancel { run } => Command::Cancel { run },
+        api::Command::Hold { run, note } => Command::Hold { run, note },
+        api::Command::Release { run } => Command::Release { run },
         api::Command::Pause { definition, note } => Command::Pause { definition, note },
         api::Command::Resume { definition } => Command::Resume { definition },
         api::Command::Stop { enabled } => Command::Stop { enabled },
@@ -183,11 +190,21 @@ fn runs(filter: &Runs) -> api::Runs {
         before_ms: filter.before_ms,
     }
 }
+/// ouro's list queries put a marker where a run's host data is; `inspect` of
+/// the run itself returns the data.
+fn host(admission: &ouro_durable::Admission) -> Option<HostData> {
+    admission.host().map(|data| match data.as_str() {
+        Some(api::REDACTED) => HostData::Hidden,
+        _ => HostData::Shown(data.clone()),
+    })
+}
 fn saved(run: ouro_durable::SavedRun) -> Result<SavedRun> {
+    let interrupted = matches!(run.outcome, Some(ows::run::Status::Interrupted(_)));
     let error = match run.outcome {
         Some(ows::run::Status::Faulted(e) | ows::run::Status::Interrupted(e)) => Some(value(e)?),
         _ => None,
     };
+    let host = host(&run.admission);
     Ok(SavedRun {
         id: run.admission.id,
         definition: run.admission.name,
@@ -198,6 +215,14 @@ fn saved(run: ouro_durable::SavedRun) -> Result<SavedRun> {
         parent: run.child.map(|c| c.parent),
         error,
         annotations: run.annotations,
+        held: run.held.map(|h| Hold {
+            actor: h.actor,
+            reason: h.reason,
+            note: h.note,
+            at_ms: h.at_ms,
+        }),
+        interrupted,
+        host,
     })
 }
 fn waiting(wait: ows::events::PendingWait) -> Result<PendingWait> {
@@ -307,6 +332,8 @@ fn inspection(inspection: api::Inspection) -> Result<Inspection> {
         budget_limit: inspection.budget_limit,
         trace_id: inspection.trace_id,
         span_id: inspection.span_id,
+        pinned: inspection.pinned,
+        digest: inspection.digest,
     })
 }
 #[async_trait]
@@ -494,20 +521,32 @@ impl ControlClient for OuroControl {
 fn definition(summary: api::DefinitionSummary) -> Result<Definition> {
     let tripped = summary
         .tripped
-        .map(|t| match t.manual {
-            Some(m) => Ok(Trip::Manual {
-                actor: m.actor,
-                reason: m.reason,
-                note: m.note,
-                at_ms: t.at_ms,
-            }),
-            None => Ok(Trip::Automatic {
-                faults: t.faults,
-                threshold: t.threshold,
-                run: t.run,
-                error: value(t.reason)?.to_string(),
-                at_ms: t.at_ms,
-            }),
+        .map(|t| {
+            let breaker = || -> Result<BreakerTrip> {
+                Ok(BreakerTrip {
+                    faults: t.faults,
+                    threshold: t.threshold,
+                    run: t.run.clone(),
+                    error: value(&t.reason)?.to_string(),
+                    at_ms: t.at_ms,
+                })
+            };
+            match t.manual.clone() {
+                // A pause alone has no breaker report; beside a breaker trip
+                // it keeps it.
+                Some(m) => Ok(Trip::Manual {
+                    actor: m.actor,
+                    reason: m.reason,
+                    note: m.note,
+                    at_ms: t.at_ms,
+                    digest: t.digest.clone(),
+                    breaker: t.breaker.then(breaker).transpose()?,
+                }),
+                None => Ok(Trip::Automatic {
+                    breaker: breaker()?,
+                    digest: t.digest.clone(),
+                }),
+            }
         })
         .transpose()?;
     let schedules = summary
@@ -518,6 +557,7 @@ fn definition(summary: api::DefinitionSummary) -> Result<Definition> {
                 api::ScheduleKind::Every => "every",
                 api::ScheduleKind::Cron => "cron",
                 api::ScheduleKind::After => "after",
+                api::ScheduleKind::At => "at",
                 api::ScheduleKind::On => "on",
             }
             .into(),
@@ -550,6 +590,12 @@ fn definition(summary: api::DefinitionSummary) -> Result<Definition> {
                 activated_ms: v.activated_ms,
                 activated_by: v.activated_by,
                 activation_note: v.activation_note,
+                digest: v.digest,
+                breaker: match v.breaker {
+                    ows::model::Breaker::Inherit => Breaker::Inherit,
+                    ows::model::Breaker::Off => Breaker::Off,
+                    ows::model::Breaker::Threshold(n) => Breaker::Threshold(n),
+                },
             })
             .collect(),
         active: summary.active.map(|v| v.to_string()),

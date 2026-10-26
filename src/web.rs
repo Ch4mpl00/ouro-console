@@ -226,6 +226,41 @@ fn badge(state: RunState) -> Markup {
     };
     html! { span class=(format!("badge bg-{color}-lt")) { (state.label()) } }
 }
+/// The hold marker beside a run's state: who froze it is in the tooltip.
+fn held_badge(held: Option<&Hold>) -> Markup {
+    html! { @if let Some(h) = held { " " span class="badge bg-orange-lt" title=(format!("held by {} · {}", h.actor, h.reason)) { "held" } } }
+}
+/// A content digest, shortened; the whole value is its tooltip.
+fn digest_view(digest: &str) -> Markup {
+    html! { @if digest.is_empty() { span class="text-secondary" { "none (version not in the catalog)" } }
+    @else { code title=(digest) { (digest.chars().take(12).collect::<String>()) "…" } } }
+}
+/// A call's recorded state. Outcomes that are not a plain answer say what
+/// they mean for the effect: not executed (none), unknown (it may have run
+/// and is never sent again), interrupted (the worker stopped; an
+/// at-least-once call is sent again on recovery).
+fn call_state(call: &CallEntry, run_interrupted: bool) -> Markup {
+    let (color, note) = match call.state.as_str() {
+        "not_executed" => ("azure", Some("proven not executed: no effect")),
+        "unknown" => ("orange", Some("may have run; never sent again")),
+        "pending" if run_interrupted && call.delivery == "at_least_once" => (
+            "purple",
+            Some("interrupted: sent again when the run recovers"),
+        ),
+        "pending" => ("secondary", None),
+        "failed" => ("red", None),
+        _ => ("green", None),
+    };
+    html! { span class=(format!("badge bg-{color}-lt")) { code { (call.state) } }
+    @if let Some(note) = note { div class="text-secondary small" { (note) } } }
+}
+fn host_view(host: &Option<HostData>) -> Markup {
+    html! { @match host {
+        None => { span class="text-secondary" { "none" } },
+        Some(HostData::Hidden) => { span class="text-secondary" { "host data (hidden)" } },
+        Some(HostData::Shown(data)) => { pre class="mb-0" { (data) } },
+    } }
+}
 fn status_badge(stopped: bool) -> Markup {
     html! { span id="runtime-status" hx-get="/status" hx-trigger="every 2s" hx-swap="outerHTML" class=(if stopped { "badge bg-red-lt" } else { "badge bg-green-lt" }) { span class="status-dot" {} (if stopped { "Emergency stop SET" } else { "Emergency stop clear" }) } }
 }
@@ -262,7 +297,7 @@ async fn layout(app: &App, title: &str, subtitle: &str, content: Markup) -> Resu
                     h1 class="page-title" { (title) } p class="text-secondary mt-2 mb-0" { (subtitle) }
                 } div class="col-auto" { span class="badge bg-azure-lt" { (app.session.client.backend_label()) } } } }
                 (content)
-            } footer class="container-xl py-3 text-secondary small" { "Actor: " (app.session.actor) " · ouro-console v0.1" } }
+            } footer class="container-xl py-3 text-secondary small" { "Actor: " (app.session.actor) " · ouro-console v0.2" } }
         } }
     } })
 }
@@ -364,11 +399,11 @@ async fn runs(
         div class="card-header" { h2 class="card-title" { (if query.history { "Terminal history" } else { "Run activity" }) } span class="ms-auto text-secondary small" { (icon("refresh")) " Live · 2s" } }
         div class="table-responsive" { table class="table table-vcenter card-table" { thead { tr { th { "Run / definition" } th { "State" } th { "Version" } th { "Admitted" } th { "Tokens" } th { "Parent" } @if !app.session.read_only { th { "Action" } } } }
             tbody { @for run in &page.items { tr {
-                td { a class="fw-semibold" href=(format!("/runs/{}",run.id)) { (run.id) } div class="text-secondary small" { (run.definition) } }
-                td { (badge(run.state)) } td { code { (run.version) } } td title=(time(run.admitted_ms)) { (age(run.admitted_ms)) }
+                td { a class="fw-semibold" href=(format!("/runs/{}",run.id)) { (run.id) } div class="text-secondary small" { (run.definition) @if matches!(run.host, Some(HostData::Hidden)) { " · host data (hidden)" } } }
+                td { (badge(run.state)) (held_badge(run.held.as_ref())) } td { code { (run.version) } } td title=(time(run.admitted_ms)) { (age(run.admitted_ms)) }
                 td { (run_tokens(&run.annotations)) }
                 td { @if let Some(parent) = &run.parent { a href=(format!("/runs/{parent}")) { (parent) } } @else { "—" } }
-                @if !app.session.read_only { td { @if !run.state.terminal() { a class="btn btn-sm btn-outline-danger" href=(format!("/runs/{}#actions",run.id)) { "Cancel" } } } }
+                @if !app.session.read_only { td { @if !run.state.terminal() { div class="btn-list flex-nowrap" { a class="btn btn-sm btn-outline-warning" href=(format!("/runs/{}#actions",run.id)) { (if run.held.is_some() { "Release" } else { "Hold" }) } a class="btn btn-sm btn-outline-danger" href=(format!("/runs/{}#actions",run.id)) { "Cancel" } } } } }
             } }
             @if page.items.is_empty() { tr { td colspan=(if app.session.read_only { 6 } else { 7 }) class="text-secondary p-4" { "No matching runs in this page." @if page.next.is_some() { " More candidates are available; continue to the next page." } } } }
         } } }
@@ -415,7 +450,7 @@ async fn children_tree(app: &App, root: &Inspection) -> Result<Markup> {
         rows.push((child, depth));
     }
     Ok(
-        html! { ul class="list-group list-group-flush" { @for (child,depth) in &rows { li class="list-group-item" { span style=(format!("padding-left:{}px",depth*20)) { (icon("corner-down-right")) " " a href=(format!("/runs/{}",child.id)) { (child.id) } " " (badge(child.state)) } } } @if rows.is_empty() { li class="list-group-item text-secondary" { "No owned children" } } } },
+        html! { ul class="list-group list-group-flush" { @for (child,depth) in &rows { li class="list-group-item" { span style=(format!("padding-left:{}px",depth*20)) { (icon("corner-down-right")) " " a href=(format!("/runs/{}",child.id)) { (child.id) } " " (badge(child.state)) (held_badge(child.held.as_ref())) } } } @if rows.is_empty() { li class="list-group-item text-secondary" { "No owned children" } } } },
     )
 }
 async fn detail(State(app): State<App>, Path(id): Path<String>) -> Result<Markup> {
@@ -439,10 +474,13 @@ async fn detail(State(app): State<App>, Path(id): Path<String>) -> Result<Markup
         });
     layout(&app,&format!("Run {id}"),"Pinned execution evidence and operator controls.",html! {
         div class="row g-4" { div class="col-lg-8" {
-            section class="card mb-4" { div class="card-header" { h2 class="card-title" { "Execution" } span class="ms-auto" { (badge(i.run.state)) } }
+            section class="card mb-4" { div class="card-header" { h2 class="card-title" { "Execution" } span class="ms-auto" { (badge(i.run.state)) (held_badge(i.run.held.as_ref())) @if i.run.interrupted { " " span class="badge bg-purple-lt" { "interrupted" } } } }
                 div class="card-body" { dl class="row mb-0" {
                     dt class="col-sm-3" { "Definition / version" } dd class="col-sm-9" { (i.run.definition) " / " code { (i.run.version) } }
                     dt class="col-sm-3" { "Admitted" } dd class="col-sm-9" { (time(i.run.admitted_ms)) }
+                    dt class="col-sm-3" { "Version digest" } dd class="col-sm-9" { (digest_view(&i.digest)) " " @if i.pinned { span class="badge bg-azure-lt" title="Started at a version the host named" { "pinned version" } } @else { span class="text-secondary small" { "started at the active version" } } }
+                    @if let Some(h) = &i.run.held { dt class="col-sm-3 text-orange" { "Held" } dd class="col-sm-9" { "By " strong { (h.actor) } " · " span title=(time(h.at_ms)) { (age(h.at_ms)) } p class="mb-0" { (h.reason) } @if !h.note.is_empty() { p class="text-secondary mb-0" { (h.note) } } div class="text-secondary small" { "Frozen with its live owned descendants; nothing is claimed or due until released." } } }
+                    dt class="col-sm-3" { "Host data" } dd class="col-sm-9" { (host_view(&i.run.host)) }
                     dt class="col-sm-3" { "Lease holder / expiry" } dd class="col-sm-9" { @if let Some(lease) = &i.lease { (lease.holder) " · " (time(lease.expires_ms)) } @else { "No active lease" } }
                     dt class="col-sm-3" { "Jump budget" } dd class="col-sm-9" { (i.budget_spent) " spent / " (i.budget_limit.map(|n|n.to_string()).unwrap_or_else(||"unbounded".into())) }
                     dt class="col-sm-3" { "Trace" } dd class="col-sm-9" { @match &i.trace_id {
@@ -452,7 +490,7 @@ async fn detail(State(app): State<App>, Path(id): Path<String>) -> Result<Markup
                             div { @if let Some(link) = trace { a href=(link) target="_blank" rel="noopener noreferrer" { "Open trace " (icon("external-link")) } } @else { span class="text-secondary small" { "Set --trace-url to link your trace backend" } } }
                         },
                     } }
-                    @if let Some(error) = &i.run.error { dt class="col-sm-3 text-danger" { "Terminal error" } dd class="col-sm-9" { pre { (error) } } }
+                    @if let Some(error) = &i.run.error { dt class="col-sm-3 text-danger" { (if i.run.state.terminal() { "Terminal error" } else { "Last interruption" }) } dd class="col-sm-9" { pre { (error) } } }
                 } }
             }
             section id="usage" class="card mb-4" { div class="card-header" { h2 class="card-title" { "Usage" } span class="ms-auto text-secondary small" { "Call annotations summed per name" } }
@@ -462,7 +500,7 @@ async fn detail(State(app): State<App>, Path(id): Path<String>) -> Result<Markup
             }
             section class="card mb-4" { div class="card-header" { h2 class="card-title" { "Call journal" } } div class="table-responsive" { table class="table card-table" {
                 thead { tr { th { "Function / key" } th { "Delivery" } th { "State" } th { "Annotations" } th { "Evidence" } } }
-                tbody { @for call in &i.calls { tr { td { (call.function) div class="text-secondary small" { (call.key) } } td { (call.delivery) } td { code { (call.state) } }
+                tbody { @for call in &i.calls { tr { td { (call.function) div class="text-secondary small" { (call.key) } } td { (call.delivery) } td { (call_state(call, i.run.interrupted)) }
                     td { @let a = shown(call.annotations.iter().map(|(k, v)| (k, v.as_str().map_or_else(|| v.to_string(), str::to_owned)))); @if a.is_empty() { span class="text-secondary" { "—" } } @else { (annotations(&a, false)) } }
                     td { details { summary { "Arguments / result" } pre { (call.arguments) } pre { (json!(call.result)) } } } } } }
             } } }
@@ -471,7 +509,13 @@ async fn detail(State(app): State<App>, Path(id): Path<String>) -> Result<Markup
         } div class="col-lg-4" {
             section class="card mb-4" { div class="card-header" { h2 class="card-title" { "Owned children tree" } } (tree) }
             @if !app.session.read_only { section id="actions" class="card mb-4" { div class="card-header" { h2 class="card-title" { "Run controls" } } div class="card-body" {
-                p class="text-secondary" { "Both commands cancel this run and its owned descendants atomically. Dispatched effects cannot be retracted." }
+                @if !i.run.state.terminal() {
+                    p class="text-secondary" { "Hold freezes this run and its live owned descendants without ending them; a call already dispatched still records its answer. Release lets them continue from the same place." }
+                    @if i.run.held.is_some() { (reason_form("release","Release run",field("run",&id),html!{})) }
+                    @else { (reason_form("hold","Hold run",field("run",&id),html! { label class="form-label" { "Note" input class="form-control" name="note" placeholder="Optional note"; } })) }
+                    hr;
+                }
+                p class="text-secondary" { "Both commands cancel this run and its owned descendants atomically (a hold ends). Dispatched effects cannot be retracted." }
                 (compact_action("cancel","Cancel run",field("run",&id))) hr; (compact_action("cancel-tree","Cancel tree",field("run",&id)))
             } } }
             a href=(format!("/journal?run={id}")) { "Operator journal for this run " (icon("arrow-right")) }
@@ -593,6 +637,11 @@ struct PageQuery {
 fn next_link(path: &str, q: PageQuery, next: Option<Cursor>) -> Markup {
     html! { @if let Some(next) = next { @let mut q = q; @let _ = q.cursor.replace(next); a class="btn mt-3" href=(format!("{path}?{}",serde_urlencoded::to_string(q).expect("query"))) { "Next page" } } }
 }
+fn breaker_view(breaker: &BreakerTrip, digest: &str) -> Markup {
+    html! { span class="badge bg-red-lt" { "automatically tripped" } " " span class="text-secondary small" title=(time(breaker.at_ms)) { (age(breaker.at_ms)) }
+    p class="mt-2" { (breaker.faults) " / " (breaker.threshold) " faults · " a href=(format!("/runs/{}", breaker.run)) { (breaker.run) } } p { (breaker.error) }
+    p class="text-secondary small" { "Refuses admissions with content digest " (digest_view(digest)) " (of any version number) and versions the catalog does not hold; other content is admitted. Activate a version in the host to clear this trip." } }
+}
 fn schedule_info(s: &Schedule, paused: bool) -> Markup {
     html! { div {
         strong { (s.kind) } " · "
@@ -608,6 +657,7 @@ fn version_info(v: &Version) -> Markup {
         @match v.activated_ms { Some(at) => { "activated " span title=(time(at)) { (time(at)) } }, None => { span class="text-secondary" { "never activated" } } }
         @if let Some(by) = &v.activated_by { " by " (by) }
         @if let Some(note) = &v.activation_note { span class="text-secondary" { " · " (note) } }
+        div class="text-secondary small" { "digest " (digest_view(&v.digest)) " · breaker policy " code { (v.breaker.label()) } }
     } }
 }
 #[derive(Deserialize)]
@@ -658,14 +708,16 @@ async fn definitions(State(app): State<App>, Query(q): Query<PageQuery>) -> Resu
                     dt class="col-sm-4" { "Schedule" } dd class="col-sm-8" { @if d.schedules.is_empty() { "No schedule" } @for s in &d.schedules { (schedule_info(s, matches!(d.tripped, Some(Trip::Manual { .. })))) } }
                     dt class="col-sm-4" { "Breaker" } dd class="col-sm-8" { @match &d.tripped {
                         None => { span class="badge bg-green-lt" { "healthy" } " · " (d.faults) " consecutive faults" },
-                        Some(Trip::Automatic {faults,threshold,run,error,at_ms}) => { span class="badge bg-red-lt" { "automatically tripped" } " " span class="text-secondary small" title=(time(*at_ms)) { (age(*at_ms)) } p class="mt-2" { (faults) " / " (threshold) " faults · " a href=(format!("/runs/{run}")) { (run) } } p { (error) } p class="text-secondary small" { "Activate a version in the host to clear this trip." } },
-                        Some(Trip::Manual {actor,reason,note,at_ms}) => { span class="badge bg-yellow-lt" { "manually paused" } " " span class="text-secondary small" title=(time(*at_ms)) { (age(*at_ms)) } p class="mt-2" { "By " (actor) " · " (reason) } p class="text-secondary" { (note) } },
+                        Some(Trip::Automatic { breaker, digest }) => { (breaker_view(breaker, digest)) },
+                        Some(Trip::Manual { actor, reason, note, at_ms, digest, breaker }) => { span class="badge bg-yellow-lt" { "manually paused" } " " span class="text-secondary small" title=(time(*at_ms)) { (age(*at_ms)) } p class="mt-2" { "By " (actor) " · " (reason) } p class="text-secondary" { (note) }
+                            p class="text-secondary small" { "A manual pause refuses every admission of every version, whatever its content." }
+                            @if let Some(breaker) = breaker { hr; (breaker_view(breaker, digest)) } },
                     } }
                 }
                 @if !app.session.read_only { @match &d.tripped {
                     None => { (reason_form("pause","Pause definition",field("definition",&d.name),html! { label class="form-label" { "Note" input class="form-control" name="note" placeholder="Optional maintenance note"; } })) },
                     Some(Trip::Manual {..}) => { (reason_form("resume","Resume definition",field("definition",&d.name),html!{})) },
-                    Some(Trip::Automatic {..}) => {},
+                    Some(Trip::Automatic { .. }) => { (reason_form("pause","Pause definition",field("definition",&d.name),html! { label class="form-label" { "Note" input class="form-control" name="note" placeholder="Optional maintenance note"; } })) },
                 } }
             }
         } } } }
@@ -759,6 +811,13 @@ async fn action(
     let id = required(f.request_id, "request_id")?;
     let command = match action.as_str() {
         "cancel" | "cancel-tree" => Command::Cancel {
+            run: required(f.run, "run")?,
+        },
+        "hold" => Command::Hold {
+            run: required(f.run, "run")?,
+            note: f.note.unwrap_or_default(),
+        },
+        "release" => Command::Release {
             run: required(f.run, "run")?,
         },
         "pause" => Command::Pause {

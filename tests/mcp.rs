@@ -84,6 +84,8 @@ async fn streamable_http_initializes_and_lists_all_schemas(backend: Backend) {
             "get_definition",
             "get_definition_totals",
             "list_workers",
+            "hold_run",
+            "release_run",
             "cancel_run",
             "cancel_tree",
             "pause_definition",
@@ -118,6 +120,14 @@ async fn every_tool_can_be_called_over_http_and_writes_are_real(backend: Backend
         ("list_definitions", json!({"limit": 10})),
         ("get_definition", json!({"definition": "cleanup"})),
         ("list_workers", json!({})),
+        (
+            "hold_run",
+            json!({"run":"run-002","note":"look at it","reason":"test hold","request_id":"test"}),
+        ),
+        (
+            "release_run",
+            json!({"run":"run-008","reason":"test release","request_id":"test"}),
+        ),
         (
             "cancel_run",
             json!({"run":"run-002","reason":"test cancellation","request_id":"test"}),
@@ -190,10 +200,15 @@ async fn every_tool_can_be_called_over_http_and_writes_are_real(backend: Backend
                 assert!(text.contains("model-a"), "{text}");
                 if name == "inspect_run" {
                     assert!(text.contains(common::TRACE_ID), "{text}");
+                    assert!(text.contains("digest") && text.contains("pinned"), "{text}");
                 }
             }
             "list_definitions" => {
                 let text = reply.to_string();
+                assert!(
+                    text.contains("breaker") && text.contains("digest"),
+                    "{text}"
+                );
                 for name in ["archive", "cleanup", "review", "transform"] {
                     assert!(text.contains(name), "{text}");
                 }
@@ -220,6 +235,25 @@ async fn every_tool_can_be_called_over_http_and_writes_are_real(backend: Backend
             "cancel_run" | "cancel_tree" => assert_eq!(
                 fixture.inspect("run-008").await.unwrap().unwrap().run.state,
                 RunState::Cancelled
+            ),
+            "hold_run" => {
+                let held = fixture.inspect("run-002").await.unwrap().unwrap().run.held;
+                let held = held.unwrap();
+                assert_eq!(
+                    (held.actor.as_str(), held.note.as_str()),
+                    ("mcp-operator", "look at it")
+                );
+                assert_eq!(held.reason, "test hold");
+            }
+            "release_run" => assert!(
+                fixture
+                    .inspect("run-008")
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .run
+                    .held
+                    .is_none()
             ),
             "pause_definition" => assert!(
                 fixture

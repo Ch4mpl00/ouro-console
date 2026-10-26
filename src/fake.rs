@@ -52,6 +52,9 @@ impl FakeControl {
                             || json!({"type":"timeout","detail":"upstream deadline exceeded"}),
                         ),
                         annotations: usage(),
+                        held: None,
+                        interrupted: false,
+                        host: None,
                     },
                     lease: (state == RunState::Running).then(|| Lease {
                         holder: "worker-a".into(),
@@ -92,7 +95,22 @@ impl FakeControl {
                     budget_limit: Some(100),
                     trace_id: Some("0123456789abcdef0123456789abcdef".into()),
                     span_id: Some("0123456789abcdef".into()),
+                    pinned: false,
+                    digest: digest(definition, 2),
                 },
+            );
+        }
+        // Host data is kept on the run; lists show it hidden.
+        // A run started at a named version, with host data, which the worker
+        // had to abandon: recoverable.
+        if let Some(run) = runs.get_mut("run-001") {
+            run.run.host = Some(HostData::Shown(json!({"tenant":"demo","ticket":"T-1"})));
+            run.pinned = true;
+            run.run.version = "v1".into();
+            run.digest = digest("review", 1);
+            run.run.interrupted = true;
+            run.run.error = Some(
+                json!({"type":"urn:ouro:errors:call.interrupted","detail":"worker stopped before the call answered"}),
             );
         }
         let wait = PendingWait {
@@ -123,6 +141,11 @@ impl FakeControl {
             child.run.definition = "transform".into();
             child.run.version = "v1".into();
             child.lease = None;
+            child.run.host = None;
+            child.run.interrupted = false;
+            child.run.error = None;
+            child.pinned = false;
+            child.digest = digest("transform", 1);
             child.calls.clear();
             child.annotations.clear();
             child.run.annotations.clear();
@@ -144,9 +167,21 @@ impl FakeControl {
             }
             runs.insert(id.into(), child);
         }
-        let versions = |n: u64| {
+        // An operator's hold on a leaf of the owned tree.
+        if let Some(run) = runs.get_mut("run-008") {
+            run.run.held = Some(Hold {
+                actor: "demo-operator".into(),
+                reason: "inspect the downstream effect".into(),
+                note: "release after review".into(),
+                at_ms: now - 120_000,
+            });
+        }
+        let versions = |name: &str, n: u64, breaker: Breaker| {
             (1..=n)
                 .map(|v| Version {
+                    digest: digest(name, v),
+                    // Only the latest version carries the demo's policy.
+                    breaker: if v == n { breaker } else { Breaker::Inherit },
                     version: format!("v{v}"),
                     activated_ms: Some(now - 86_400_000 / i64::try_from(v).unwrap_or(1)),
                     activated_by: (v > 1).then(|| "demo-operator".into()),
@@ -164,7 +199,7 @@ impl FakeControl {
         let definitions = vec![
             Definition {
                 name: "review".into(),
-                versions: versions(2),
+                versions: versions("review", 2, Breaker::Threshold(5)),
                 active: Some("v2".into()),
                 epoch: 2,
                 faults: 0,
@@ -173,7 +208,7 @@ impl FakeControl {
             },
             Definition {
                 name: "transform".into(),
-                versions: versions(1),
+                versions: versions("transform", 1, Breaker::Inherit),
                 active: Some("v1".into()),
                 epoch: 1,
                 faults: 0,
@@ -182,23 +217,26 @@ impl FakeControl {
             },
             Definition {
                 name: "archive".into(),
-                versions: versions(2),
+                versions: versions("archive", 2, Breaker::Threshold(3)),
                 active: Some("v2".into()),
                 epoch: 3,
                 faults: 3,
                 tripped: Some(Trip::Automatic {
-                    faults: 3,
-                    threshold: 3,
-                    run: "run-005".into(),
-                    error: "upstream deadline exceeded".into(),
-                    at_ms: now - 400_000,
+                    breaker: BreakerTrip {
+                        faults: 3,
+                        threshold: 3,
+                        run: "run-005".into(),
+                        error: "upstream deadline exceeded".into(),
+                        at_ms: now - 400_000,
+                    },
+                    digest: digest("archive", 2),
                 }),
                 // An automatic trip disarms the schedule: no next due time.
                 schedules: vec![schedule("cron", None)],
             },
             Definition {
                 name: "cleanup".into(),
-                versions: versions(1),
+                versions: versions("cleanup", 1, Breaker::Off),
                 active: Some("v1".into()),
                 epoch: 1,
                 faults: 1,
@@ -207,6 +245,8 @@ impl FakeControl {
                     reason: "maintenance window".into(),
                     note: "resume after review".into(),
                     at_ms: now - 300_000,
+                    digest: digest("cleanup", 1),
+                    breaker: None,
                 }),
                 schedules: vec![Schedule {
                     queued: Some(QueuedSlot {
@@ -313,7 +353,7 @@ impl FakeControl {
                         },
                         &r.id,
                     ),
-                    r.clone(),
+                    listed(r.clone()),
                 )
             })
             .collect();
@@ -321,6 +361,40 @@ impl FakeControl {
         page.items
             .retain(|r| filter.state.is_none_or(|s| s == r.state));
         Ok(page)
+    }
+}
+/// A stand-in for a version's content digest: stable per name and version.
+fn digest(name: &str, version: u64) -> String {
+    let mut state = version.wrapping_add(0x9e37_79b9_7f4a_7c15);
+    (0..4)
+        .map(|_| {
+            for byte in name.bytes() {
+                state = (state ^ u64::from(byte)).wrapping_mul(0x0100_0000_01b3);
+            }
+            format!("{state:016x}")
+        })
+        .collect()
+}
+/// What a list query shows of a run: its host data hidden.
+fn listed(mut run: SavedRun) -> SavedRun {
+    if run.host.is_some() {
+        run.host = Some(HostData::Hidden);
+    }
+    run
+}
+/// The run and its transitive owned descendants.
+fn tree(data: &Data, run: &str) -> BTreeSet<String> {
+    let mut ids = BTreeSet::from([run.to_owned()]);
+    loop {
+        let before = ids.len();
+        for inspect in data.runs.values() {
+            if inspect.run.parent.as_ref().is_some_and(|p| ids.contains(p)) {
+                ids.insert(inspect.run.id.clone());
+            }
+        }
+        if ids.len() == before {
+            return ids;
+        }
     }
 }
 /// What the demo's calls summed to, on the run row and in the inspection.
@@ -431,18 +505,7 @@ impl ControlClient for FakeControl {
                 if !data.runs.contains_key(run) {
                     return Err(ControlError::NotFound(format!("run {run} not found")));
                 }
-                let mut ids = BTreeSet::from([run.clone()]);
-                loop {
-                    let before = ids.len();
-                    for inspect in data.runs.values() {
-                        if inspect.run.parent.as_ref().is_some_and(|p| ids.contains(p)) {
-                            ids.insert(inspect.run.id.clone());
-                        }
-                    }
-                    if ids.len() == before {
-                        break;
-                    }
-                }
+                let ids = tree(&data, run);
                 let mut changed = false;
                 for id in ids {
                     if let Some(inspect) = data.runs.get_mut(&id)
@@ -452,7 +515,43 @@ impl ControlClient for FakeControl {
                         inspect.run.ended_ms = Some(now_ms());
                         inspect.lease = None;
                         inspect.waits.clear();
+                        // A cancellation ends the hold.
+                        inspect.run.held = None;
                         changed = true;
+                    }
+                }
+                Reply::Changed(changed)
+            }
+            Command::Hold { run, note } => {
+                if !data.runs.contains_key(run) {
+                    return Err(ControlError::NotFound(format!("run {run} not found")));
+                }
+                let held = Hold {
+                    actor: request.actor.clone(),
+                    reason: request.reason.clone(),
+                    note: note.clone(),
+                    at_ms: now_ms(),
+                };
+                let mut changed = false;
+                for id in tree(&data, run) {
+                    if let Some(inspect) = data.runs.get_mut(&id)
+                        && !inspect.run.state.terminal()
+                        && inspect.run.held.is_none()
+                    {
+                        inspect.run.held = Some(held.clone());
+                        changed = true;
+                    }
+                }
+                Reply::Changed(changed)
+            }
+            Command::Release { run } => {
+                if !data.runs.contains_key(run) {
+                    return Err(ControlError::NotFound(format!("run {run} not found")));
+                }
+                let mut changed = false;
+                for id in tree(&data, run) {
+                    if let Some(inspect) = data.runs.get_mut(&id) {
+                        changed |= inspect.run.held.take().is_some();
                     }
                 }
                 Reply::Changed(changed)
@@ -463,13 +562,27 @@ impl ControlClient for FakeControl {
                     .iter_mut()
                     .find(|d| &d.name == definition)
                     .ok_or_else(|| ControlError::NotFound("definition not found".into()))?;
-                let changed = d.tripped.is_none();
+                // A pause beside a breaker trip keeps the breaker's report.
+                let changed = !matches!(d.tripped, Some(Trip::Manual { .. }));
                 if changed {
+                    let (digest, breaker) = match d.tripped.take() {
+                        Some(Trip::Automatic { breaker, digest }) => (digest, Some(breaker)),
+                        _ => (
+                            d.active
+                                .as_ref()
+                                .and_then(|a| d.versions.iter().find(|v| &v.version == a))
+                                .map(|v| v.digest.clone())
+                                .unwrap_or_default(),
+                            None,
+                        ),
+                    };
                     d.tripped = Some(Trip::Manual {
                         actor: request.actor.clone(),
                         reason: request.reason.clone(),
                         note: note.clone(),
                         at_ms: now_ms(),
+                        digest,
+                        breaker,
                     });
                 }
                 Reply::Changed(changed)
@@ -480,13 +593,22 @@ impl ControlClient for FakeControl {
                     .iter_mut()
                     .find(|d| &d.name == definition)
                     .ok_or_else(|| ControlError::NotFound("definition not found".into()))?;
-                if matches!(d.tripped, Some(Trip::Automatic { .. })) {
-                    return Err(ControlError::Conflict(
-                        "automatic breaker trip requires activation of a version".into(),
-                    ));
+                match d.tripped.take() {
+                    None => Reply::Changed(false),
+                    Some(Trip::Automatic { breaker, digest }) => {
+                        d.tripped = Some(Trip::Automatic { breaker, digest });
+                        return Err(ControlError::Conflict(
+                            "automatic breaker trip requires activation of a version".into(),
+                        ));
+                    }
+                    // Lifts the pause alone; a breaker trip beside it stands.
+                    Some(Trip::Manual {
+                        breaker, digest, ..
+                    }) => {
+                        d.tripped = breaker.map(|breaker| Trip::Automatic { breaker, digest });
+                        Reply::Changed(true)
+                    }
                 }
-                let changed = d.tripped.take().is_some();
-                Reply::Changed(changed)
             }
             Command::Stop { enabled } => {
                 let changed = data.stopped != *enabled;
@@ -574,7 +696,7 @@ impl ControlClient for FakeControl {
                 .runs
                 .values()
                 .filter(|r| r.run.parent.as_deref() == Some(run))
-                .map(|r| r.run.clone())
+                .map(|r| listed(r.run.clone()))
                 .collect();
             i
         }))
@@ -643,7 +765,13 @@ impl ControlClient for FakeControl {
         let page = self.query(filter, history, cursor, limit)?;
         let mut states = BTreeMap::new();
         for run in page.items {
-            *states.entry(run.state.label().into()).or_default() += 1;
+            // A held run is counted as held, whatever state it froze in.
+            let label = if run.held.is_some() {
+                "held"
+            } else {
+                run.state.label()
+            };
+            *states.entry(label.into()).or_default() += 1;
         }
         Ok(Counts {
             states,
